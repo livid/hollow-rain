@@ -1,0 +1,1893 @@
+<title>Hollow Rain</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Silkscreen&display=swap">
+<style>
+  /* Single-look page: the cover is always a rainy night, so it paints its own dark ground. */
+  :root {
+    color-scheme: dark;
+    --void: #0a0c18;
+    --ink: #dfe6ea;
+    --dim: #8fa3bd;
+    --amber: #f0a040;
+    --panel: rgba(10, 12, 24, 0.78);
+    --line: rgba(143, 163, 189, 0.28);
+  }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--void);
+    color: var(--ink);
+    overflow: hidden;
+    font: 12px/1.4 ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  }
+  #stage { position: fixed; inset: 0; overflow: hidden; background: var(--void); }
+  #screen { display: block; width: 100%; height: 100%; image-rendering: pixelated; }
+
+  #hud {
+    position: fixed;
+    left: 16px;
+    bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+    max-width: calc(100% - 32px);
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 12px;
+    padding: 8px 10px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    transition: opacity 0.6s ease;
+  }
+  #hud .name {
+    font-family: "Silkscreen", ui-monospace, monospace;
+    font-size: 13px;
+    letter-spacing: 0.06em;
+    color: var(--amber);
+  }
+  #clock { color: var(--dim); font-variant-numeric: tabular-nums; }
+  #hud button {
+    font: inherit;
+    color: var(--ink);
+    background: transparent;
+    border: 1px solid var(--line);
+    padding: 3px 8px;
+    cursor: pointer;
+  }
+  #hud button:hover { border-color: var(--dim); }
+  #hud button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+  #hud kbd { color: var(--dim); font: inherit; }
+  body.idle #hud, body.hud-off #hud { opacity: 0; pointer-events: none; }
+  body.idle, body.idle #screen { cursor: none; }
+</style>
+
+<div id="stage"><canvas id="screen" aria-label="Animated pixel-art diorama: a haunted floating island in the rain at night"></canvas></div>
+<div id="hud" role="toolbar" aria-label="Playback controls">
+  <span class="name">Hollow Rain</span>
+  <span id="clock">0:00 / 2:00</span>
+  <button id="btn-play" type="button">Pause <kbd>Space</kbd></button>
+  <button id="btn-sound" type="button" aria-pressed="false">Sound on <kbd>M</kbd></button>
+  <button id="btn-full" type="button">Fullscreen <kbd>F</kbd></button>
+  <button id="btn-hide" type="button">Hide controls <kbd>H</kbd></button>
+</div>
+
+<script id="engine">
+/* Hollow Rain engine. DOM-free and deterministic: every frame is a pure function of loop time,
+   so the page and render.mjs (Node) produce identical pixels, and the loop seam is exact. */
+var HollowRain = (function () {
+  'use strict';
+  const BASE_W = 480, BASE_H = 270;   // design resolution: 4x = 1920x1080
+  const CORE_W = 360, CORE_H = 240;   // island + moon must stay visible at any screen size
+  const T = 120;                      // loop length in seconds
+  const TAU = Math.PI * 2;
+
+  // Layers register themselves; createScene runs them in order.
+  const LAYERS = [];
+  function layer(order, name, init, draw) { LAYERS.push({ order, name, init, draw }); }
+
+  /* ---------- helpers ---------- */
+  // Colors are Uint32 in ImageData byte order (little-endian ABGR).
+  function hex(h) {
+    const n = parseInt(h.slice(1), 16);
+    return (0xff000000 | ((n & 255) << 16) | (n & 0xff00) | (n >>> 16)) >>> 0;
+  }
+  const R = (c) => c & 255, G = (c) => (c >>> 8) & 255, B = (c) => (c >>> 16) & 255;
+  function mix(c1, c2, f) {
+    return (0xff000000 | ((B(c1) + (B(c2) - B(c1)) * f) << 16) | ((G(c1) + (G(c2) - G(c1)) * f) << 8) | (R(c1) + (R(c2) - R(c1)) * f)) >>> 0;
+  }
+  function blend(buf, i, c, a) {
+    const d = buf[i];
+    buf[i] = (0xff000000 | ((B(d) + (B(c) - B(d)) * a) << 16) | ((G(d) + (G(c) - G(d)) * a) << 8) | (R(d) + (R(c) - R(d)) * a)) >>> 0;
+  }
+  function add(buf, i, c, a) {   // additive glow, clamped
+    const d = buf[i];
+    const r = Math.min(255, R(d) + R(c) * a), g = Math.min(255, G(d) + G(c) * a), b = Math.min(255, B(d) + B(c) * a);
+    buf[i] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+  }
+
+  // Named palette (see PLAN.md).
+  const PAL = {
+    void: hex('#0a0c18'), indigo: hex('#141a2e'), slate: hex('#24304a'), rain: hex('#5b7396'),
+    mist: hex('#8fa3bd'), moon: hex('#dfe6ea'), ember: hex('#7a2a1e'), pumpkin: hex('#d8662a'),
+    amber: hex('#f0a040'), candle: hex('#ffd27a'), core: hex('#fff4d6'),
+  };
+
+  // Material ramps: steps 0-3 are cold night shades, 4-7 warm lit shades.
+  const RAMP_DEFS = {
+    grass:   ['#0b1117', '#111c22', '#18282c', '#213634', '#3a3f2a', '#5e5528', '#8f7430', '#c69a45'],
+    soil:    ['#0d0a12', '#17111b', '#221822', '#2f2129', '#4a2c24', '#6e3d26', '#975530', '#c2773f'],
+    clay:    ['#121119', '#1c1a25', '#282533', '#363241', '#54423a', '#7a5a42', '#a4784e', '#cf9d62'],
+    stone:   ['#151a26', '#1f2636', '#2c3547', '#3d485c', '#5d5a5c', '#857563', '#b1946d', '#dcbc8a'],
+    wood:    ['#110f18', '#1a1722', '#25202e', '#322b3b', '#53352e', '#7a4b30', '#a66637', '#d28b46'],
+    roof:    ['#0e0f1d', '#161a2c', '#20263d', '#2c3450', '#4a3a48', '#6f4744', '#9a5a42', '#c97b4a'],
+    bark:    ['#0a0a12', '#121220', '#1b1b2b', '#262638', '#3d3037', '#5c4036', '#825739', '#ab7443'],
+    pumpkin: ['#1f1418', '#33191a', '#4d231c', '#69301f', '#9a4322', '#c65a24', '#e67a2c', '#f7a040'],
+    iron:    ['#07080e', '#0d0f18', '#151824', '#1f2332', '#353038', '#56423e', '#7c5a45', '#a6784f'],
+    vine:    ['#08110e', '#0e1c15', '#15291c', '#1e3824', '#384624', '#5a5c26', '#80782e', '#ab953a'],
+    bone:    ['#1d1f2a', '#2d3140', '#444a5a', '#5e6577', '#857d74', '#ab9a80', '#cdb58f', '#ecd6a8'],
+  };
+  const MAT = {};                       // name -> ramp id (1-based; 0 = empty)
+  const RAMPS = new Uint32Array((Object.keys(RAMP_DEFS).length + 1) * 8);
+  Object.keys(RAMP_DEFS).forEach((k, i) => {
+    MAT[k] = i + 1;
+    RAMP_DEFS[k].forEach((h, s) => { RAMPS[(i + 1) * 8 + s] = hex(h); });
+  });
+
+  // 4x4 ordered-dither thresholds in [0,1).
+  const BAYER = new Float32Array([0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map((v) => (v + 0.5) / 16));
+  const bayer = (x, y) => BAYER[((y & 3) << 2) | (x & 3)];
+
+  // Seeded RNG (mulberry32) so every build of the scene is identical.
+  function rng(seed) {
+    let a = seed >>> 0;
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const fract = (x) => x - Math.floor(x);
+  const clamp = (x, a, b) => (x < a ? a : x > b ? b : x);
+  const smooth = (e0, e1, x) => { const t = clamp((x - e0) / (e1 - e0), 0, 1); return t * t * (3 - 2 * t); };
+  // Loop-safe oscillator: n must be an integer number of cycles per loop.
+  const wave = (u, n, ph) => Math.sin(TAU * (n * u + (ph || 0)));
+
+  // Tileable value noise: wraps every px by py lattice cells, so scrolling it by whole
+  // tiles per loop keeps the seam exact.
+  function tileNoise(seed, px, py) {
+    const r = rng(seed), g = new Float32Array(px * py);
+    for (let i = 0; i < g.length; i++) g[i] = r();
+    return function (x, y) {
+      const xf = Math.floor(x), yf = Math.floor(y);
+      let fx = x - xf, fy = y - yf;
+      fx = fx * fx * (3 - 2 * fx);
+      fy = fy * fy * (3 - 2 * fy);
+      const x0 = ((xf % px) + px) % px, y0 = ((yf % py) + py) % py;
+      const x1 = x0 + 1 === px ? 0 : x0 + 1, y1 = y0 + 1 === py ? 0 : y0 + 1;
+      const a = g[y0 * px + x0], b = g[y0 * px + x1], c = g[y1 * px + x0], d = g[y1 * px + x1];
+      return a + (b - a) * fx + (c - a) * fy + (a - b - c + d) * fx * fy;
+    };
+  }
+  // Fractal version: octave o tiles at (px, py) * 2^o, so the whole sum tiles at (px, py).
+  function tileFbm(seed, px, py, octaves) {
+    const ns = [];
+    for (let o = 0; o < octaves; o++) ns.push(tileNoise(seed + o * 101, px << o, py << o));
+    return function (x, y) {
+      let v = 0, amp = 0.5, norm = 0;
+      for (let o = 0; o < octaves; o++) { v += ns[o](x * (1 << o), y * (1 << o)) * amp; norm += amp; amp *= 0.5; }
+      return v / norm;
+    };
+  }
+  // Loop-safe 1D noise over u in [0,1): `cycles` random knots around the loop.
+  function loopNoise(seed, cycles) {
+    const n = tileNoise(seed, cycles, 1);
+    return (u) => n(u * cycles, 0);
+  }
+
+  // Stage material canvas (480x270): each pixel holds a ramp id and a base step.
+  // Props are drawn into it once; the lit composite turns it into color every frame.
+  function mset(S, x, y, mat, step) {
+    x |= 0; y |= 0;
+    if (x < 0 || y < 0 || x >= BASE_W || y >= BASE_H) return;
+    const i = y * BASE_W + x;
+    S.mid[i] = mat;
+    S.mst[i] = clamp(step | 0, 0, 7);
+  }
+  function mrect(S, x, y, w, h, mat, step) {
+    for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) mset(S, x + i, y + j, mat, step);
+  }
+  const mgetMat = (S, x, y) => (x < 0 || y < 0 || x >= BASE_W || y >= BASE_H ? 0 : S.mid[y * BASE_W + x]);
+  // Pixel sprite from strings: each char maps to [material, step]; '.' and ' ' are empty.
+  function msprite(S, x, y, rows, map, flip) {
+    for (let j = 0; j < rows.length; j++) {
+      const row = rows[j];
+      for (let i = 0; i < row.length; i++) {
+        const m = map[row[i]];
+        if (m) mset(S, flip ? x + row.length - 1 - i : x + i, y + j, m[0], m[1]);
+      }
+    }
+  }
+  // Frame-space pixel write from stage coordinates (for animated/emissive drawing).
+  function fset(S, x, y, c) {
+    x = (x | 0) + S.ox; y = (y | 0) + S.oy;
+    if (x < 0 || y < 0 || x >= S.W || y >= S.H) return;
+    S.buf[y * S.W + x] = c;
+  }
+  function fblend(S, x, y, c, a) {
+    x = (x | 0) + S.ox; y = (y | 0) + S.oy;
+    if (x < 0 || y < 0 || x >= S.W || y >= S.H) return;
+    blend(S.buf, y * S.W + x, c, a);
+  }
+  // Stage light level at a stage pixel (0 outside the stage).
+  const lightAt = (S, x, y) => (x < 0 || y < 0 || x >= BASE_W || y >= BASE_H ? 0 : S.light[(y | 0) * BASE_W + (x | 0)]);
+
+  // Allocate the shared stage buffers before any prop layer draws into them.
+  layer(0, 'stage', (S) => {
+    S.mid = new Uint8Array(BASE_W * BASE_H);
+    S.mst = new Uint8Array(BASE_W * BASE_H);
+    S.light = new Float32Array(BASE_W * BASE_H);
+  });
+
+  /* ---------- layers ---------- */
+
+  /* Sky, moon, clouds, lightning (order 10). The sky and moon are baked once per size;
+     two cloud layers scroll 1 and 2 whole tiles per loop. */
+  const dq = (f, x, y, n) => Math.floor(f * n + bayer(x, y)) / n;   // dithered quantize
+  const MOON = { x: 95, y: 52, r: 19 };
+  const SKY_STOPS = [
+    [-80, '#05060d'], [0, '#080a16'], [70, '#0d1122'], [130, '#141a2e'],
+    [180, '#1c2540'], [212, '#26324d'], [250, '#1d2640'], [340, '#10152a'],
+  ].map(([y, h]) => [y, hex(h)]);
+  const HALO = hex('#4a5b80');
+  const MOON_C = ['#f1f4f5', '#d5dde5', '#b3c0cf', '#98a9bd', '#7d8fa8'].map(hex);
+  const CRATERS = [[-6, -5, 4.2], [6, 2, 3.2], [-1, 8, 2.6], [8, -8, 2.2], [-11, 3, 1.8], [1, -1, 1.5]];
+  const CLOUD_RAMP = ['#0e1322', '#161d31', '#212a42', '#313f5c', '#4b5c80', '#7688aa', '#b6c3d8'].map(hex);
+  const FLASH_C = hex('#9fb4d6');
+  const CLOUD_Y0 = -90, CLOUD_TH = 300;       // cloud textures cover stage y -90..210
+  const FLASHES = [{ t: 41.0, x: 385, y: 60 }, { t: 97.5, x: 190, y: 30 }];
+
+  function skyAt(sy, x, y) {
+    let k = 0;
+    while (k < SKY_STOPS.length - 2 && sy > SKY_STOPS[k + 1][0]) k++;
+    const s0 = SKY_STOPS[k], s1 = SKY_STOPS[k + 1];
+    return mix(s0[1], s1[1], dq(clamp((sy - s0[0]) / (s1[0] - s0[0]), 0, 1), x, y, 4));
+  }
+
+  function moonPixel(dx, dy, d, x, y) {
+    const lim = d / MOON.r;
+    let c = MOON_C[1];
+    if (dx + dy < -MOON.r * 0.5 && lim < 0.85 && bayer(x, y) < 0.6) c = MOON_C[0];
+    if (lim > 0.8) c = MOON_C[2];
+    if (lim > 0.93 && dx + dy > 0) c = MOON_C[3];
+    for (const [cx, cy, cr] of CRATERS) {
+      const ex = dx - cx, ey = dy - cy, cd = Math.hypot(ex, ey);
+      if (cd < cr) c = ex + ey < -cr * 0.4 ? MOON_C[4] : cd > cr - 1.1 ? MOON_C[0] : MOON_C[3];
+    }
+    return c;
+  }
+
+  function buildClouds(seed, tw, cell, lo, hi, bias) {
+    const th = CLOUD_TH, cy = cell * 0.35;
+    const n = tileFbm(seed, tw / cell, Math.ceil(th / cy) + 2, 4);
+    const a = new Float32Array(tw * th), s = new Float32Array(tw * th);
+    const d = (x, y) => n(x / cell, y / cy) + bias(y + CLOUD_Y0);
+    for (let y = 0; y < th; y++) {
+      for (let x = 0; x < tw; x++) {
+        const v = d(x, y), up = d(x, y - 4);
+        a[y * tw + x] = smooth(lo, hi, v);
+        s[y * tw + x] = clamp(0.3 + (v - up) * 7, 0, 1);   // top edges catch the moon
+      }
+    }
+    return { a, s, tw, th };
+  }
+
+  const pulse = (dt) => (dt < 0 ? 0 : Math.exp(-dt * 11));
+  function flashAt(t) {
+    for (const f of FLASHES) {
+      const dt = t - f.t;
+      if (dt >= 0 && dt < 1.6) return { F: Math.min(1.2, pulse(dt) + 0.8 * pulse(dt - 0.16) + 0.55 * pulse(dt - 0.42)), f };
+    }
+    return null;
+  }
+
+  layer(10, 'sky', (S) => {
+    const { W, H, ox, oy } = S;
+    S.sky = new Uint32Array(W * H);
+    S.moonG = new Float32Array(W * H);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const i = y * W + x, dx = x - ox - MOON.x, dy = y - oy - MOON.y, d = Math.hypot(dx, dy);
+        let g = clamp(1 - (d - MOON.r) / 85, 0, 1);
+        g *= g;
+        S.moonG[i] = g;
+        S.sky[i] = d <= MOON.r + 0.4 ? moonPixel(dx, dy, d, x, y) : mix(skyAt(y - oy, x, y), HALO, dq(g * 0.55, x, y, 5));
+      }
+    }
+    S.cloudFar = buildClouds(11, 480, 40, 0.5, 0.63, (sy) => 0.1 - 0.24 * smooth(-30, 195, sy));
+    S.cloudNear = buildClouds(29, 480, 60, 0.53, 0.63, (sy) => 0.12 - 0.5 * smooth(-70, 105, sy));
+    S.flash = 0;
+  }, (S) => {
+    const { W, H, ox, oy, buf, u } = S;
+    buf.set(S.sky);
+    const fl = S.opts.lightning ? flashAt(S.t) : null;
+    const F = fl ? fl.F : 0, fx = fl ? fl.f.x : 0, fy = fl ? fl.f.y : 0;
+    S.flash = F;
+    const top = CLOUD_RAMP.length - 1;
+    for (const [cl, m, dark] of [[S.cloudFar, 1, 0], [S.cloudNear, 2, 0.1]]) {
+      const off = Math.floor(u * cl.tw * m);
+      for (let y = 0; y < H; y++) {
+        const ty = y - oy - CLOUD_Y0;
+        if (ty < 0) continue;             // tall screens: open dark sky above the cloud deck
+        if (ty >= cl.th) break;
+        const row = ty * cl.tw;
+        for (let x = 0; x < W; x++) {
+          let tx = (x - ox - off) % cl.tw;
+          if (tx < 0) tx += cl.tw;
+          const a = cl.a[row + tx];
+          if (a < 0.02) continue;
+          const q = dq(a, x, y, 3);
+          if (q <= 0) continue;
+          const i = y * W + x, g = S.moonG[i], sh = cl.s[row + tx];
+          let L = 0.1 + sh * 0.28 + g * (0.45 + 0.45 * sh) - dark;
+          if (F > 0) L += F * Math.max(0, 1 - Math.hypot(x - ox - fx, y - oy - fy) / 170) * 1.3;
+          const c = CLOUD_RAMP[clamp(Math.floor(L * top + bayer(x, y)), 0, top)];
+          if (q >= 1) buf[i] = c; else blend(buf, i, c, q);
+        }
+      }
+    }
+    if (F > 0.02) {   // sheet lightning also lifts the open sky a little
+      for (let y = 0; y < H; y++) {
+        const sy = y - oy;
+        if (sy > 215) break;
+        for (let x = 0; x < W; x++) {
+          const k = F * Math.max(0, 1 - Math.hypot(x - ox - fx, sy - fy) / 260);
+          if (k > 0.01) add(buf, y * W + x, FLASH_C, k * 0.22);
+        }
+      }
+    }
+  });
+
+  /* Far hills and a distant village (order 20), baked once; only the village windows animate. */
+  const FAR_C = {
+    r1: hex('#1a2340'), r1rim: hex('#28344f'), r2: hex('#121a2e'), r2rim: hex('#202a44'),
+    house: hex('#0e1427'), roofRim: hex('#1f2842'),
+  };
+  const WIN_C = ['#5a3424', '#a8642e', '#e39440', '#ffcf78'].map(hex);
+  const HAZE_C = hex('#3d3042');
+
+  layer(20, 'far', (S) => {
+    const { W, H, ox, oy } = S;
+    const img = new Uint32Array(W * H);
+    S.farImg = img;
+    S.farWins = [];
+    const n1 = tileNoise(71, 256, 1), n2 = tileNoise(83, 256, 1), r = rng(97);
+    const ridge1 = (sx) => 191 + (n1(sx / 46 + 128, 0) - 0.5) * 18 + (n1(sx / 13 + 64, 0) - 0.5) * 4;
+    const ridge2 = (sx) => 208 + (n2(sx / 38 + 128, 0) - 0.5) * 20 + (n2(sx / 11 + 64, 0) - 0.5) * 5;
+    const put = (sx, sy, c) => {
+      const x = sx + ox, y = sy + oy;
+      if (x >= 0 && y >= 0 && x < W && y < H) img[y * W + x] = c;
+    };
+
+    // Warm haze over the village, baked into the sky.
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const sx = x - ox, sy = y - oy;
+        const h = clamp(1 - Math.hypot((sx - 446) / 1.7, sy - 194) / 46, 0, 1);
+        if (h > 0 && sy < 206) S.sky[y * W + x] = mix(S.sky[y * W + x], HAZE_C, dq(h * h * 0.75, x, y, 4));
+      }
+    }
+
+    for (let x = 0; x < W; x++) {
+      const sx = x - ox;
+      const a1 = Math.round(ridge1(sx)), a2 = Math.round(ridge2(sx));
+      const lit1 = ridge1(sx + 1) < ridge1(sx - 1), lit2 = ridge2(sx + 1) < ridge2(sx - 1);
+      for (let y = Math.max(0, a1 + oy); y < H; y++) {
+        const sy = y - oy;
+        let c;
+        if (sy >= a2) c = sy === a2 && lit2 ? FAR_C.r2rim : FAR_C.r2;
+        else c = sy === a1 && lit1 ? FAR_C.r1rim : FAR_C.r1;
+        img[y * W + x] = c;
+      }
+    }
+
+    // Pines along the nearer ridge.
+    for (let sx = -ox - 8; sx < W - ox + 8; sx += 5 + Math.floor(r() * 11)) {
+      const h = 4 + Math.floor(r() * 6), base = Math.round(ridge2(sx));
+      for (let j = 0; j < h; j++) {
+        const hw = Math.floor((j * 2.2) / h * 1.6);
+        for (let i = -hw; i <= hw; i++) put(sx + i, base - h + j, j === 0 || i === -hw ? FAR_C.r2rim : FAR_C.r2);
+      }
+    }
+
+    // Village: houses and a steeple on the far ridge, left and right of the island.
+    const house = (sx, w, h, wins) => {
+      const base = Math.round(ridge1(sx + (w >> 1))) + 2;
+      for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) put(sx + i, base - j, FAR_C.house);
+      const rh = Math.ceil(w / 2);
+      for (let j = 0; j < rh; j++) for (let i = j; i < w - j; i++) put(sx + i, base - h - j, j === rh - 1 || i === j ? FAR_C.roofRim : FAR_C.house);
+      for (const [wx, wy] of wins) S.farWins.push({ x: sx + wx, y: base - wy, ph: r(), n: loopNoise(Math.floor(r() * 1e6), 24) });
+    };
+    house(422, 7, 5, [[2, 2], [4, 2]]);
+    house(431, 5, 4, [[2, 2]]);
+    // Steeple
+    const sb = Math.round(ridge1(447)) + 2;
+    for (let j = 0; j < 15; j++) for (let i = 0; i < 4; i++) put(445 + i, sb - j, FAR_C.house);
+    for (let j = 0; j < 8; j++) {          // spire: 2 px wide, narrowing to 1 px
+      put(446, sb - 15 - j, j === 7 ? FAR_C.roofRim : FAR_C.house);
+      if (j < 5) put(447, sb - 15 - j, FAR_C.house);
+    }
+    S.farWins.push({ x: 446, y: sb - 10, ph: 0.3, n: loopNoise(4242, 24) });
+    house(453, 8, 6, [[2, 3], [5, 3], [5, 1]]);
+    house(464, 6, 4, [[3, 2]]);
+    house(18, 6, 5, [[2, 2]]);
+    house(27, 8, 4, [[2, 2], [5, 2]]);
+    house(40, 5, 4, [[2, 1]]);
+  }, (S) => {
+    const { buf, farImg } = S;
+    for (let i = 0; i < farImg.length; i++) if (farImg[i]) buf[i] = farImg[i];
+    for (const w of S.farWins) {
+      const v = w.n(S.u);
+      fset(S, w.x, w.y, WIN_C[v > 0.72 ? 3 : v > 0.2 ? 2 : 1]);
+    }
+  });
+
+  /* Mist bank in the valley below the island (order 25); drifts one tile per loop. */
+  const MIST_C = ['#161d31', '#1d263d', '#26304a', '#303c58', '#3c4a68'].map(hex);
+  const MIST_Y0 = 196, MIST_TH = 90, MIST_TW = 480;
+  layer(25, 'mist-bank', (S) => {
+    const n = tileFbm(131, 12, 8, 3);
+    S.mistTex = new Float32Array(MIST_TW * MIST_TH);
+    for (let y = 0; y < MIST_TH; y++) {
+      const prof = smooth(MIST_Y0 + 8, MIST_Y0 + 70, MIST_Y0 + y);
+      for (let x = 0; x < MIST_TW; x++) S.mistTex[y * MIST_TW + x] = n(x / 40, y / 11) * 0.75 + prof * 0.7 - 0.25;
+    }
+  }, (S) => {
+    const { W, H, ox, oy, buf } = S;
+    const off = Math.floor(S.u * MIST_TW);
+    const top = MIST_C.length - 1;
+    for (let y = Math.max(0, oy + MIST_Y0); y < H; y++) {
+      const ty = y - oy - MIST_Y0, row = ty * MIST_TW;
+      if (ty >= MIST_TH) {                // tall screens: solid fog bank below the texture
+        for (let x = 0; x < W; x++) buf[y * W + x] = MIST_C[bayer(x, y) < 0.5 ? 2 : 3];
+        continue;
+      }
+      for (let x = 0; x < W; x++) {
+        let tx = (x - ox - off) % MIST_TW;
+        if (tx < 0) tx += MIST_TW;
+        const d = S.mistTex[row + tx];
+        const q = dq(smooth(0.25, 0.65, d), x, y, 3);
+        if (q <= 0) continue;
+        const c = MIST_C[clamp(Math.floor(d * top * 0.9 + bayer(x, y)), 0, top)];
+        if (q >= 1) buf[y * W + x] = c; else blend(buf, y * W + x, c, q);
+      }
+    }
+  });
+
+  /* Island (order 30): an elliptical grass top and a cut-away soil face, baked into the
+     material canvas. Props are placed with islBack / islFront. */
+  const ISL = { cx: 240, cy: 185, rx: 176, ry: 14 };
+  const islHalf = (x) => { const k = (x - ISL.cx) / ISL.rx; return k * k < 1 ? Math.sqrt(1 - k * k) : -1; };
+  const islBack = (x) => ISL.cy - ISL.ry * Math.max(0, islHalf(x));
+  const islFront = (x) => ISL.cy + ISL.ry * Math.max(0, islHalf(x));
+  const BURROW = { x: 352, y: 212, rx: 8, ry: 5 };
+
+  function drawRoot(S, r, x, y, len, dir, step) {   // wandering root line
+    for (let i = 0; i < len; i++) {
+      mset(S, x, y, MAT.bark, step);
+      y += 1;
+      if (r() < 0.45) x += dir;
+      if (r() < 0.15) dir = -dir;
+    }
+  }
+
+  layer(30, 'island', (S) => {
+    const r = rng(501), n = tileNoise(503, 64, 64), nb = tileNoise(509, 128, 1);
+    const { grass, soil, clay, stone, bark, wood, bone } = MAT;
+    S.islBottom = new Int16Array(BASE_W).fill(-1);
+    for (let x = ISL.cx - ISL.rx + 1; x < ISL.cx + ISL.rx; x++) {
+      const k = (x - ISL.cx) / ISL.rx;
+      const yb = Math.round(islBack(x)), yf = Math.round(islFront(x));
+      // Top surface: moonlit from the upper left, darker toward the right.
+      for (let y = yb; y < yf; y++) {
+        const v = n(x / 5, y / 2.5) - 0.5;
+        const s = 1.9 + v * 2 - k * 0.7 + (y === yb ? 0.8 : 0);
+        mset(S, x, y, grass, Math.floor(s + bayer(x, y) - 0.5));
+      }
+      // Front face strata.
+      const depth = Math.max(3, 50 * Math.pow(1 - k * k, 0.9) * (0.82 + 0.3 * nb(x / 9, 0)) + (nb(x / 3 + 40, 0) - 0.5) * 6);
+      const ybot = Math.round(yf + depth);
+      S.islBottom[x] = ybot;
+      const w1 = 4 + (n(x / 10, 7) - 0.5) * 3, w2 = 17 + (n(x / 14, 19) - 0.5) * 8, w3 = 33 + (n(x / 12, 31) - 0.5) * 10;
+      for (let y = yf; y <= ybot; y++) {
+        const d = y - yf, tex = n(x / 4, y / 3);
+        let m, s;
+        if (d < 2) { m = grass; s = d === 0 ? 3 : 2; }
+        else if (d < w1) { m = soil; s = 2; }
+        else if (d < w2) { m = soil; s = tex > 0.62 ? 2 : 1; }
+        else if (d < w3) { m = clay; s = tex > 0.64 ? 2 : 1; if (Math.abs(d - w2) < 0.8) s = 2; }
+        else { m = stone; s = n(x / 3, y / 2) > 0.58 ? 0 : tex > 0.6 ? 2 : 1; }
+        if (ybot - y < 3) s = Math.max(0, s - 1);          // underside falls into shadow
+        if (k < -0.55 && bayer(x, y) < 0.3) s++;            // moonlit left flank
+        mset(S, x, y, m, s);
+      }
+      // Grass blades on the back edge and dangling over the lip.
+      if (r() < 0.55) for (let j = 1; j <= 1 + Math.floor(r() * 3); j++) mset(S, x, yb - j, grass, 2 + (j === 1 ? 0 : 1));
+      if (r() < 0.3) for (let j = 2; j <= 2 + Math.floor(r() * 3); j++) mset(S, x, yf + j, grass, 1);
+    }
+
+    // Embedded stones.
+    for (let i = 0; i < 38; i++) {
+      const x = 80 + Math.floor(r() * 320), yf = Math.round(islFront(x)), yb = S.islBottom[x];
+      if (yb - yf < 12) continue;
+      const y = yf + 5 + Math.floor(r() * (yb - yf - 8)), w = 2 + Math.floor(r() * 4), h = 1 + Math.floor(r() * 3);
+      for (let j = 0; j <= h; j++) for (let q = 0; q <= w; q++) {
+        if ((q === 0 || q === w) && (j === 0 || j === h)) continue;
+        mset(S, x + q, y + j, stone, j === 0 || q === 0 ? 3 : j === h ? 1 : 2);
+      }
+    }
+    // Roots through the loam, and hanging below the underside.
+    for (let i = 0; i < 22; i++) {
+      const x = 76 + Math.floor(r() * 328);
+      drawRoot(S, r, x, Math.round(islFront(x)) + 2, 5 + Math.floor(r() * 12), r() < 0.5 ? -1 : 1, 2);
+    }
+    for (let i = 0; i < 16; i++) {
+      const x = 110 + Math.floor(r() * 260);
+      drawRoot(S, r, x, S.islBottom[x] + 1, 3 + Math.floor(r() * 10), r() < 0.5 ? -1 : 1, 1);
+    }
+    // Hanging rock chunks.
+    for (const [x, w, h] of [[176, 5, 5], [262, 7, 8], [318, 4, 4], [224, 3, 3]]) {
+      const y0 = S.islBottom[x] + 1;
+      for (let j = 0; j < h; j++) {
+        const hw = Math.ceil((w / 2) * (1 - j / h));
+        for (let q = -hw; q <= hw; q++) mset(S, x + q, y0 + j, stone, j === 0 ? 1 : q < 0 ? 1 : 0);
+      }
+    }
+
+    // Buried coffin (under the graveyard), shown in cross-section with its occupant.
+    const cx0 = 166, cyc = 212, len = 28;
+    for (let i = 0; i < len; i++) {
+      const hh = i < 8 ? 3 + Math.round((i / 8) * 2) : 5 - Math.round(((i - 8) / (len - 9)) * 2);
+      for (let j = -hh; j <= hh; j++) {
+        const edge = i === 0 || i === len - 1 || Math.abs(j) === hh;
+        mset(S, cx0 + i, cyc + j, wood, edge ? (j === -hh ? 3 : 2) : 0);
+      }
+    }
+    msprite(S, cx0 + 2, cyc - 2, ['.##.', '#o#o', '####', '.#.#'], { '#': [bone, 2], o: [wood, 0] });
+    for (let i = 8; i <= 16; i++) mset(S, cx0 + i, cyc, bone, 1);          // spine
+    for (const i of [9, 11, 13]) for (let j = -2; j <= 2; j++) if (j) mset(S, cx0 + i, cyc + j, bone, Math.abs(j) === 2 ? 1 : 2);
+    for (let i = 17; i <= 25; i++) { mset(S, cx0 + i, cyc - 1, bone, 2); mset(S, cx0 + i, cyc + 1, bone, 1); }
+    mset(S, cx0 + 25, cyc - 2, bone, 2); mset(S, cx0 + 25, cyc + 2, bone, 1);
+    // A stray skull and bone in the clay.
+    msprite(S, 296, 224, ['.##.', '#o#o', '####', '.#.#'], { '#': [bone, 2], o: [soil, 0] });
+    msprite(S, 302, 227, ['#...#', '.###.', '#...#'], { '#': [bone, 1] });
+
+    // Burrow carved into the soil (a candle lives here later).
+    for (let j = -BURROW.ry; j <= BURROW.ry; j++) for (let i = -BURROW.rx; i <= BURROW.rx; i++) {
+      const e = (i * i) / (BURROW.rx * BURROW.rx) + (j * j) / (BURROW.ry * BURROW.ry);
+      if (e <= 1) mset(S, BURROW.x + i, BURROW.y + j, soil, j >= BURROW.ry - 1 ? 2 : e > 0.7 ? 1 : 0);
+    }
+  });
+
+  /* Dead tree, graveyard, pumpkin patch (order 31, static). Carved faces and the lantern
+     glass are emissive and drawn per frame later; their positions are recorded here. */
+  function barkDisc(S, cx, cy, rad) {
+    if (rad < 0.8) { mset(S, cx, cy, MAT.bark, 1); return; }
+    const ri = Math.ceil(rad);
+    for (let dy = -ri; dy <= ri; dy++) for (let dx = -ri; dx <= ri; dx++) {
+      if (dx * dx + dy * dy > rad * rad) continue;
+      mset(S, cx + dx, cy + dy, MAT.bark, dx < -rad * 0.4 ? 2 : dx > rad * 0.3 ? 0 : 1);   // dark silhouette, moon rim on the left
+    }
+  }
+  function limb(S, r, x, y, ang, len, th, depth, bias) {   // ang: 0 = up, negative = left
+    for (let i = 0; i < len; i++) {
+      ang += (r() - 0.5) * 0.22 + (bias || 0);
+      x += Math.sin(ang);
+      y -= Math.cos(ang);
+      barkDisc(S, x, y, th * (1 - (i / len) * 0.45));
+    }
+    if (depth > 0) {
+      const kids = r() < 0.4 ? 3 : 2;
+      for (let k = 0; k < kids; k++) {
+        limb(S, r, x, y, ang + (k - (kids - 1) / 2) * 0.75 + (r() - 0.5) * 0.4, len * (0.55 + r() * 0.25), Math.max(0.5, th * 0.62), depth - 1, 0);
+      }
+    }
+    return { x, y };
+  }
+
+  function pumpkin(S, xc, yb, w, h, lift) {   // bottom-center anchored; ribbed and moon-shaded
+    const x0 = Math.round(xc - w / 2), y0 = yb - h + 1, rx = w / 2, ry = h / 2;
+    const ribs = w >= 10 ? [0.3, 0.5, 0.7] : w >= 7 ? [0.35, 0.65] : [0.5];
+    for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) {
+      const dx = (i + 0.5 - rx) / rx, dy = (j + 0.5 - ry) / ry;
+      if (dx * dx + dy * dy > 1.05) continue;
+      let s = 2 + (lift || 0) + (dx < -0.35 && dy < 0.3 ? 1 : 0) - (dx > 0.45 || dy > 0.6 ? 1 : 0);
+      if (ribs.some((f) => Math.abs(i + 0.5 - f * w) < 0.5)) s -= 1;
+      mset(S, x0 + i, y0 + j, MAT.pumpkin, s);
+    }
+    mset(S, Math.round(xc), y0 - 1, MAT.vine, 2);
+    if (h > 6) mset(S, Math.round(xc), y0 - 2, MAT.vine, 3), mset(S, Math.round(xc) + 1, y0 - 2, MAT.vine, 2);
+    return { x0, y0 };
+  }
+  // Carved face masks, by pumpkin width (rows of 'x' glow).
+  const FACES = {
+    12: ['............', '..xx....xx..', '..xxx..xxx..', '............', '.....xx.....', '..x..xx..x..', '..xxxxxxxx..', '...xx..xx...', '............'],
+    8: ['........', '.xx..xx.', '.xx..xx.', '........', '.x.xx.x.', '.xxxxxx.', '........'],
+    7: ['.......', '.x...x.', '.xx.xx.', '.......', '.xxxxx.', '..x.x..', '.......'],
+  };
+  function jack(S, xc, yb, w, h) {
+    const { x0, y0 } = pumpkin(S, xc, yb, w, h, 1);
+    const pts = [];
+    FACES[w].forEach((row, j) => { for (let i = 0; i < row.length; i++) if (row[i] === 'x') pts.push([x0 + i, y0 + j]); });
+    S.jacks.push({ x: Math.round(xc), y: yb - (h >> 1), pts, n: loopNoise(S.jacks.length * 31 + 7, 240) });
+  }
+
+  function tombstone(S, x0, yb, kind) {
+    const { stone, vine, grass } = MAT;
+    const sh = (i, w) => (i === 0 ? 3 : i === w - 1 ? 1 : 2);
+    if (kind === 'round') {
+      const w = 8, h = 11;
+      for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) {
+        if (j < 2 && (i === 0 || i === w - 1)) continue;
+        if (j === 0 && (i === 1 || i === w - 2)) continue;
+        mset(S, x0 + i, yb - h + 1 + j, stone, sh(i, w) + (j === 0 ? 1 : 0));
+      }
+      for (const [i, j] of [[2, 3], [3, 3], [4, 3], [5, 3], [2, 5], [3, 5], [4, 5], [5, 5], [2, 7], [3, 7], [4, 7]]) mset(S, x0 + i, yb - h + 1 + j, stone, 1);
+    } else if (kind === 'cross') {
+      for (let j = 0; j < 13; j++) for (let i = 0; i < 3; i++) mset(S, x0 + 2 + i, yb - 12 + j, stone, sh(i, 3));
+      for (let i = 0; i < 7; i++) for (let j = 0; j < 2; j++) mset(S, x0 + i, yb - 9 + j, stone, i === 0 ? 3 : j === 0 ? 3 : 2);
+      S.crossTop = { x: x0 + 3, y: yb - 12 };
+    } else if (kind === 'tilt') {
+      const w = 7, h = 9;
+      for (let j = 0; j < h; j++) {
+        const shx = Math.floor((h - j) / 3);
+        for (let i = 0; i < w; i++) {
+          if (j === 0 && (i === 0 || i === w - 1)) continue;
+          mset(S, x0 + i + shx, yb - h + 1 + j, stone, sh(i, w));
+        }
+      }
+    } else {   // obelisk
+      for (let j = 0; j < 15; j++) {
+        const w = j < 3 ? 1 + j : 5;
+        const off = Math.floor((5 - w) / 2);
+        for (let i = 0; i < w; i++) mset(S, x0 + off + i, yb - 14 + j, stone, sh(i, w) + (j < 3 ? 1 : 0));
+      }
+      for (let i = -1; i < 6; i++) mset(S, x0 + i, yb, stone, i < 1 ? 3 : 2);
+    }
+    for (let i = 0; i < 3; i++) mset(S, x0 + 1 + i * 2, yb, vine, 2);            // moss at the foot
+    for (let i = -2; i < 10; i++) mset(S, x0 + i, yb + 1, grass, 1);               // shadowed mound
+  }
+
+  layer(31, 'props-left', (S) => {
+    const r = rng(777);
+    S.jacks = [];
+    // Tree trunk: leans slightly, root flare at the base, moonlit on the left.
+    for (let y = 182; y >= 108; y--) {
+      const f = (182 - y) / 74;
+      const cx = 118 - (182 - y) * 0.09 + Math.sin(y / 9) * 1.1;
+      const hw = 3.6 - f * 1.7 + (y > 176 ? (y - 176) * 0.9 : 0);
+      for (let dx = Math.floor(-hw); dx <= Math.ceil(hw); dx++) {
+        if (Math.abs(dx) > hw + 0.3) continue;
+        mset(S, cx + dx, y, MAT.bark, dx < -hw * 0.45 ? 3 : dx > hw * 0.3 ? 0 : 1);
+      }
+    }
+    for (const [x, y] of [[117, 150], [117, 151], [118, 151], [116, 151]]) mset(S, x, y, MAT.bark, 0);   // knot hole
+    limb(S, r, 113, 124, -0.75, 40, 2.3, 3, -0.004);    // toward the moon
+    limb(S, r, 112, 110, -0.1, 34, 2.0, 3, 0);          // crown
+    limb(S, r, 114, 116, 0.55, 30, 1.9, 3, 0);          // up-right
+    limb(S, r, 116, 142, -1.1, 22, 1.6, 2, 0.01);       // low left
+    const hook = limb(S, rng(4), 119, 131, 1.35, 30, 1.8, 0, -0.004);   // lantern branch
+    for (let i = 0; i < 4; i++) limb(S, r, hook.x - 8 - i * 5, hook.y + 1, 0.3 + r() * 0.6, 5 + r() * 5, 0.5, 1, 0);
+    S.lantern = { px: Math.round(hook.x), py: Math.round(hook.y) + 1, len: 19 };
+
+    // Crooked iron fence along the back of the graveyard.
+    const { iron } = MAT;
+    for (let x = 146; x <= 224; x += 4) {
+      const base = Math.round(islBack(x)) + 3, h = 9 + (x % 8 === 2 ? 2 : 0), lean = x === 162 || x === 206 ? 1 : 0;
+      for (let j = 0; j < h; j++) mset(S, x + (j > h / 2 ? lean : 0), base - j, iron, j === h - 1 ? 3 : 2);
+      mset(S, x + lean, base - h, iron, 3);
+    }
+    for (let x = 146; x <= 224; x++) {
+      const base = Math.round(islBack(x)) + 3;
+      if (x < 186 || x > 190) mset(S, x, base - 6, iron, 1);   // a gap where a rail rusted away
+      mset(S, x, base - 2, iron, 1);
+    }
+
+    tombstone(S, 152, 186, 'round');
+    tombstone(S, 169, 181, 'cross');
+    tombstone(S, 186, 188, 'tilt');
+    tombstone(S, 204, 183, 'obelisk');
+    jack(S, 214, 191, 7, 7);
+
+    // Pumpkin patch with curling vines.
+    for (let i = 0; i < 70; i++) {
+      const x = 80 + Math.floor(r() * 70), y = 186 + Math.floor(r() * 12);
+      if (y < islBack(x) + 3 || y > islFront(x) - 1) continue;
+      mset(S, x, y, MAT.vine, 1 + (r() < 0.4 ? 1 : 0));
+      if (r() < 0.3) mset(S, x + 1, y - 1, MAT.vine, 2);
+    }
+    pumpkin(S, 90, 189, 6, 5);
+    pumpkin(S, 117, 190, 9, 7);
+    pumpkin(S, 132, 196, 7, 5);
+    pumpkin(S, 143, 192, 5, 4);
+    pumpkin(S, 82, 195, 5, 4);
+    jack(S, 102, 196, 12, 9);
+  });
+
+  /* Crooked house (order 32, static). The whole building leans right with height; windows
+     are recorded for the emissive pass, which applies the same lean. */
+  const houseLean = (y) => Math.floor((181 - y) / 24);
+  const HOUSE = {
+    main: { x0: 282, x1: 330, top: 128 }, peak: { x: 307, y: 80 }, eaveL: 276, eaveR: 336,
+    wing: { x0: 331, x1: 360, top: 150 }, chimney: { x0: 320, x1: 327, top: 84 },
+    door: { x0: 288, x1: 297, top: 163 },
+  };
+  function hset(S, x, y, m, s) { mset(S, x + houseLean(y), y, m, s); }
+
+  layer(32, 'house', (S) => {
+    const { wood, roof, stone, iron } = MAT, H0 = HOUSE, base = 180;
+    S.windows = [];
+    // Side wing walls (a step darker than the main block).
+    for (let y = H0.wing.top; y <= base; y++) for (let x = H0.wing.x0; x <= H0.wing.x1; x++) {
+      hset(S, x, y, wood, x === H0.wing.x1 ? 0 : (y - H0.wing.top) % 4 === 3 ? 0 : 1);
+    }
+    // Wing shed roof sloping down to the right.
+    for (let x = H0.wing.x0 - 1; x <= H0.wing.x1 + 4; x++) {
+      const yt = Math.round(137 + (x - H0.wing.x0) * 0.5);
+      for (let y = yt; y <= yt + 3; y++) hset(S, x, y, roof, y === yt ? 3 : y === yt + 3 ? 0 : (x + y) % 5 === 0 ? 1 : 2);
+      for (let y = yt + 4; y < H0.wing.top; y++) hset(S, x, y, wood, 0);
+    }
+    // Main block: horizontal planks, corner boards, stone foundation.
+    for (let y = H0.main.top; y <= base; y++) for (let x = H0.main.x0; x <= H0.main.x1; x++) {
+      let s = (y - H0.main.top) % 4 === 3 ? 1 : 2;
+      if (x === H0.main.x0) s = 3;
+      else if (x === H0.main.x1) s = 1;
+      if ((x * 7 + Math.floor(y / 4) * 13) % 23 === 0) s = 1;          // plank seams
+      if (y >= base - 2) { hset(S, x, y, stone, y === base - 2 ? 3 : 2); continue; }
+      hset(S, x, y, wood, s);
+    }
+    for (let x = H0.main.x0 - 1; x <= H0.main.x1 + 1; x++) hset(S, x, 152, wood, 3);   // floor trim
+    // Chimney (stone) rising behind the right roof slope.
+    for (let y = H0.chimney.top; y <= 110; y++) for (let x = H0.chimney.x0; x <= H0.chimney.x1; x++) {
+      const brick = (y % 3 === 0) || ((x + (Math.floor(y / 3) % 2) * 2) % 4 === 0);
+      hset(S, x, y, stone, x === H0.chimney.x0 ? 3 : x === H0.chimney.x1 ? 0 : brick ? 1 : 2);
+    }
+    for (let x = H0.chimney.x0 - 1; x <= H0.chimney.x1 + 1; x++) { hset(S, x, H0.chimney.top - 1, stone, 3); hset(S, x, H0.chimney.top, stone, 2); }
+    S.chimneyTop = { x: 324 + houseLean(H0.chimney.top), y: H0.chimney.top - 2 };
+    // Steep gable roof: shingle rows, moonlit left slope, dark right slope.
+    for (let y = H0.peak.y; y <= H0.main.top; y++) {
+      const f = (y - H0.peak.y) / (H0.main.top - H0.peak.y);
+      const xl = Math.round(H0.peak.x - f * (H0.peak.x - H0.eaveL)), xr = Math.round(H0.peak.x + f * (H0.eaveR - H0.peak.x));
+      for (let x = xl; x <= xr; x++) {
+        const row = Math.floor((y - H0.peak.y) / 3), seam = (x + row * 2) % 5 === 0 || (y - H0.peak.y) % 3 === 2;
+        let s = x < H0.peak.x ? (seam ? 2 : 3) : seam ? 0 : 1;
+        if (x === xl || x === xr) s = x === xl ? 3 : 0;
+        if (y === H0.main.top) s = 0;
+        hset(S, x, y, roof, s);
+      }
+    }
+    // Gable face under the roof edge (front-facing triangle of planks) with the attic window.
+    for (let y = H0.peak.y + 8; y < H0.main.top; y++) {
+      const f = (y - H0.peak.y) / (H0.main.top - H0.peak.y);
+      const xl = Math.round(H0.peak.x - f * (H0.peak.x - H0.eaveL)) + 4, xr = Math.round(H0.peak.x + f * (H0.eaveR - H0.peak.x)) - 4;
+      for (let x = xl; x <= xr; x++) hset(S, x, y, wood, y % 4 === 3 ? 1 : 2);
+    }
+    // Windows: frame and sill as material; glass is emissive.
+    const win = (x0, y0, w, h, kind, extra) => {
+      for (let j = -1; j <= h; j++) for (let i = -1; i <= w; i++) hset(S, x0 + i, y0 + j, wood, j === -1 || i === -1 ? 3 : 1);
+      for (let i = -2; i <= w + 1; i++) hset(S, x0 + i, y0 + h + 1, wood, i < w ? 3 : 2);
+      S.windows.push(Object.assign({ x0, y0, w, h, kind }, extra));
+    };
+    win(305, 154, 17, 13, 'cat');
+    win(287, 135, 9, 11, 'figure');
+    win(313, 135, 9, 11, 'curtain');
+    win(341, 158, 9, 9, 'plain');
+    // Round attic window.
+    const ax = 307, ay = 112;
+    for (let j = -5; j <= 5; j++) for (let i = -5; i <= 5; i++) {
+      const d = Math.hypot(i, j);
+      if (d <= 5.2) hset(S, ax + i, ay + j, wood, d > 4.2 ? (i + j < 0 ? 3 : 1) : 0);
+    }
+    S.windows.push({ x0: ax - 4, y0: ay - 4, w: 9, h: 9, kind: 'attic', round: true });
+    // Door with an arched top, a knob and a small lit pane.
+    const D = H0.door;
+    for (let y = D.top; y <= base - 3; y++) for (let x = D.x0 - 1; x <= D.x1 + 1; x++) {
+      const arch = y - D.top < 2 && (x <= D.x0 || x >= D.x1);
+      if (arch && y === D.top) continue;
+      const frame = x === D.x0 - 1 || x === D.x1 + 1 || y === D.top;
+      hset(S, x, y, wood, frame ? 3 : (x - D.x0) % 3 === 2 ? 0 : 1);
+    }
+    hset(S, D.x1 - 2, 172, iron, 3);
+    S.windows.push({ x0: D.x0 + 3, y0: D.top + 4, w: 4, h: 3, kind: 'pane' });
+    // Porch roof on two posts, and a wall lamp beside the door.
+    for (let x = D.x0 - 5; x <= D.x1 + 5; x++) { hset(S, x, D.top - 5, roof, 3); hset(S, x, D.top - 4, roof, 1); hset(S, x, D.top - 3, wood, 0); }
+    for (let y = D.top - 2; y <= base - 3; y++) { hset(S, D.x0 - 4, y, wood, 2); hset(S, D.x1 + 4, y, wood, 1); }
+    S.porchLamp = { x: D.x0 - 2 + houseLean(166), y: 166 };
+    // Stone steps out front, then stepping stones toward the lip.
+    for (let k = 0; k < 3; k++) {
+      const w = 14 + k * 2, x0 = 293 - (w >> 1), y = 181 + k * 2;
+      for (let i = 0; i < w; i++) { mset(S, x0 + i, y, stone, i === 0 ? 3 : 2); mset(S, x0 + i, y + 1, stone, 1); }
+    }
+    for (const [x, y, w] of [[286, 189, 6], [279, 193, 7], [270, 196, 6]]) {
+      for (let i = 0; i < w; i++) { mset(S, x + i, y, stone, i < 2 ? 3 : 2); if (i && i < w - 1) mset(S, x + i, y + 1, stone, 1); }
+    }
+    jack(S, 283, 186, 7, 7);
+    jack(S, 304, 188, 8, 7);
+  });
+
+  /* Campfire, tripod, cauldron, log seat (order 33, static). Flames and brew are emissive. */
+  const FIRE = { x: 237, y: 194 };          // base center of the flames
+  const CAULDRON = { x: 237, y: 171 };      // rim center
+  function mline(S, x0, y0, x1, y1, m, s) {
+    const n = Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0));
+    for (let i = 0; i <= n; i++) mset(S, Math.round(x0 + ((x1 - x0) * i) / n), Math.round(y0 + ((y1 - y0) * i) / n), m, s);
+  }
+  layer(33, 'campfire', (S) => {
+    const { stone, wood, bark, iron } = MAT, F = FIRE, C = CAULDRON;
+    // Scorched ground under the fire.
+    for (let j = -3; j <= 3; j++) for (let i = -12; i <= 12; i++) {
+      if ((i * i) / 144 + (j * j) / 9 <= 1) mset(S, F.x + i, F.y + j, MAT.soil, 1 + ((i + j) & 1));
+    }
+    // Crossed logs with charred ends.
+    mline(S, F.x - 8, F.y + 1, F.x + 7, F.y - 2, wood, 2);
+    mline(S, F.x - 8, F.y + 2, F.x + 7, F.y - 1, wood, 1);
+    mline(S, F.x - 7, F.y - 2, F.x + 8, F.y + 1, bark, 2);
+    mline(S, F.x - 7, F.y - 1, F.x + 8, F.y + 2, bark, 1);
+    // Stone ring (front arc).
+    for (let a = 0.15; a < Math.PI - 0.1; a += 0.34) {
+      const x = Math.round(F.x + Math.cos(a) * 12), y = Math.round(F.y + Math.sin(a) * 3.2);
+      mset(S, x, y, stone, 3); mset(S, x + 1, y, stone, 2); mset(S, x, y + 1, stone, 1); mset(S, x + 1, y + 1, stone, 1);
+    }
+    // Iron tripod and chain.
+    mline(S, F.x - 12, F.y + 1, C.x - 1, C.y - 9, iron, 2);
+    mline(S, F.x + 12, F.y + 1, C.x + 1, C.y - 9, iron, 1);
+    mline(S, F.x - 11, F.y + 1, C.x - 1, C.y - 9, iron, 1);
+    mset(S, C.x, C.y - 10, iron, 3);
+    for (let y = C.y - 9; y <= C.y - 4; y++) mset(S, C.x, y, iron, y % 2 ? 2 : 3);
+    // Cauldron: rounded pot, bright rim, handle arc.
+    for (let j = 0; j <= 10; j++) {
+      const hw = Math.round(8 * Math.sqrt(1 - Math.pow((j - 3) / 8.2, 2)));
+      for (let i = -hw; i <= hw; i++) mset(S, C.x + i, C.y + 1 + j, iron, i < -hw * 0.5 && j < 7 ? 3 : i > hw * 0.4 || j > 7 ? 1 : 2);
+    }
+    for (let i = -8; i <= 8; i++) { mset(S, C.x + i, C.y, iron, Math.abs(i) === 8 ? 2 : 3); mset(S, C.x + i, C.y - 1, iron, i < 0 ? 3 : 2); }
+    for (let i = -6; i <= 6; i++) mset(S, C.x + i, C.y - 3 - Math.round(Math.sqrt(36 - i * i) / 3), iron, 2);
+    S.brew = { x0: C.x - 6, x1: C.x + 6, y: C.y - 1 };
+    // Log seat to the right of the fire.
+    for (let x = 256; x <= 275; x++) {
+      mset(S, x, 191, bark, 3); mset(S, x, 192, wood, 2); mset(S, x, 193, wood, 2); mset(S, x, 194, wood, 1); mset(S, x, 195, bark, 0);
+      if (x % 6 === 0) mset(S, x, 193, wood, 1);
+    }
+    for (let j = 191; j <= 195; j++) mset(S, 276, j, wood, j === 193 ? 1 : 3);
+  });
+
+  /* Warm lights (order 35): each has a precomputed falloff map (flattened below the source,
+     so pools on the ground read as ellipses) scaled by a loop-safe flicker every frame. */
+  function makeLight(S, x, y, R, gain, flick, kDown, fall) {
+    kDown = kDown || 1.6;
+    fall = fall || 1.6;
+    const x0 = Math.max(0, Math.floor(x - R)), x1 = Math.min(BASE_W - 1, Math.ceil(x + R));
+    const y0 = Math.max(0, Math.floor(y - R)), y1 = Math.min(BASE_H - 1, Math.ceil(y + R / kDown));
+    const w = x1 - x0 + 1, h = y1 - y0 + 1, map = new Float32Array(w * h);
+    const srcAbove = y < islFront(x);
+    for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) {
+      const px = x0 + i, py = y0 + j, dy = py - y;
+      const d = Math.hypot(px - x, dy > 0 ? dy * kDown : dy) / R;
+      if (d >= 1) continue;
+      let v = gain * Math.pow(1 - d, fall);
+      const pxAbove = py <= islFront(px) + 1;
+      if (pxAbove !== srcAbove) v *= 0.1;          // the lip blocks light between top and face
+      map[j * w + i] = v;
+    }
+    const L = { x, y, R, x0, y0, w, h, map, flick, cur: 1 };
+    S.lights.push(L);
+    return L;
+  }
+
+  const WINDOW_LIGHT = { cat: [32, 0.85], figure: [20, 0.6], curtain: [16, 0.4], plain: [19, 0.55], attic: [15, 0.45], pane: [9, 0.3] };
+  layer(35, 'lights', (S) => {
+    S.lights = [];
+    const fa = loopNoise(11, 1200), fb = loopNoise(12, 360);
+    S.fireLight = makeLight(S, FIRE.x, FIRE.y - 8, 72, 1.3, (u) => 0.72 + 0.2 * fb(u) + 0.14 * fa(u), 2.2);
+    makeLight(S, CAULDRON.x, CAULDRON.y - 1, 16, 0.35, (u) => 0.8 + 0.2 * fb(u));
+    const la = loopNoise(21, 360), lb = loopNoise(22, 1440);
+    S.lanternLight = makeLight(S, S.lantern.px, S.lantern.py + S.lantern.len + 2, 60, 1.05, (u) => 0.86 + 0.09 * la(u) + 0.05 * lb(u), 1.05);
+    const pa = loopNoise(31, 300), pb = loopNoise(32, 1200);
+    S.porchLight = makeLight(S, S.porchLamp.x, S.porchLamp.y, 34, 1.0, (u) => 0.88 + 0.08 * pa(u) + 0.04 * pb(u), 1.3);
+    S.windows.forEach((w, k) => {
+      const cy = w.y0 + w.h / 2, cx = w.x0 + w.w / 2 + houseLean(cy);
+      const [R, g] = WINDOW_LIGHT[w.kind], n = loopNoise(40 + k, w.kind === 'cat' ? 480 : 120);
+      w.light = makeLight(S, cx, cy + 2, R, g, (u) => (w.kind === 'cat' ? 0.84 + 0.14 * n(u) : 0.93 + 0.06 * n(u)), 1.1, 2.2);
+    });
+    S.jacks.forEach((j, k) => {
+      const f = loopNoise(60 + k, 900);
+      j.light = makeLight(S, j.x, j.y, 24, 0.85, (u) => 0.72 + 0.18 * j.n(u) + 0.1 * f(u), 1.8);
+    });
+    const ca = loopNoise(77, 700);
+    S.burrowLight = makeLight(S, BURROW.x + 2, BURROW.y + 1, 20, 1.0, (u) => 0.82 + 0.14 * ca(u), 1.2);
+  }, (S) => {
+    const light = S.light;
+    light.fill(0);
+    for (const L of S.lights) {
+      const k = (L.cur = L.flick(S.u));
+      for (let j = 0; j < L.h; j++) {
+        let li = (L.y0 + j) * BASE_W + L.x0, mi = j * L.w;
+        for (let i = 0; i < L.w; i++, li++, mi++) light[li] += L.map[mi] * k;
+      }
+    }
+  });
+
+  /* Lit composite (order 40): material steps shifted up by the warm light buffer with
+     ordered dithering, so light pools read as real pixel-art ramps. */
+  layer(40, 'lit', null, (S) => {
+    const { buf, W, H, ox, oy, mid, mst, light } = S;
+    const F = S.flash;
+    const y0 = Math.max(0, -oy), y1 = Math.min(BASE_H, H - oy);
+    const x0 = Math.max(0, -ox), x1 = Math.min(BASE_W, W - ox);
+    for (let y = y0; y < y1; y++) {
+      let si = y * BASE_W + x0, fi = (y + oy) * W + x0 + ox;
+      for (let x = x0; x < x1; x++, si++, fi++) {
+        const m = mid[si];
+        if (!m) continue;
+        let s = mst[si];
+        const L = light[si];
+        if (L > 0.01) s += Math.floor(L * 4 + bayer(x, y));
+        buf[fi] = RAMPS[m * 8 + (s > 7 ? 7 : s)];
+        if (F > 0.05) blend(buf, fi, FLASH_C, F * 0.12);
+      }
+    }
+  });
+
+  /* Emissive pass (order 50): flames, glass, carved faces and halos, drawn straight to the
+     frame with the same flicker values that drive the light buffer. */
+  const GLOW = ['#6a3320', '#b8642c', '#e8923c', '#ffc868', '#fff0c8'].map(hex);
+  const FLAME_C = ['#7a2a1e', '#c24a22', '#f0a040', '#ffd27a', '#fff4d6'].map(hex);
+  const IRON_DARK = hex('#1c1820'), IRON_LIT = hex('#6b4a3a'), ROPE = hex('#2b2530');
+  const flameN = tileFbm(901, 8, 8, 3), brewN = tileNoise(907, 8, 1);
+
+  function halo(S, x, y, R, c, a) {
+    const R2 = R * R;
+    for (let j = -R; j <= R; j++) {
+      const fy = y + j + S.oy;
+      if (fy < 0 || fy >= S.H) continue;
+      for (let i = -R; i <= R; i++) {
+        const d2 = i * i + j * j, fx = x + i + S.ox;
+        if (d2 >= R2 || fx < 0 || fx >= S.W) continue;
+        const f = 1 - Math.sqrt(d2) / R, q = dq(a * f * f, fx, fy, 16);
+        if (q > 0) add(S.buf, fy * S.W + fx, c, q);
+      }
+    }
+  }
+
+  function drawFire(S) {
+    const scroll = S.u * 8 * 150, k = S.fireLight.cur, Hm = 15 + 7 * k;
+    for (let j = 0; j < 26; j++) {
+      const y = FIRE.y - j;
+      for (let i = -10; i <= 10; i++) {
+        const x = FIRE.x + i, env = 1 - (i / 10.5) * (i / 10.5);
+        if (env <= 0) continue;
+        const n = flameN(x / 4 + 0.37, y / 4 + scroll);
+        const v = 1 - j / (Hm * env) + (n - 0.5) * 1.1 + (bayer(x, y) - 0.5) * 0.12;
+        if (v < 0.1) continue;
+        if (j > 3 && S.mid[y * BASE_W + x] === MAT.iron) continue;   // flames wrap behind the pot
+        fset(S, x, y, FLAME_C[v > 0.95 ? 4 : v > 0.72 ? 3 : v > 0.48 ? 2 : v > 0.28 ? 1 : 0]);
+      }
+    }
+  }
+
+  function drawBrew(S) {
+    const b = S.brew, u = S.u;
+    for (let x = b.x0 + 1; x <= b.x1 - 1; x++) {
+      const v = brewN(x / 3 + u * 8 * 30, 0);
+      fset(S, x, b.y, GLOW[v > 0.62 ? 3 : v > 0.35 ? 2 : 1]);
+    }
+    for (let q = 0; q < 5; q++) {
+      const ph = fract(u * (70 + q * 13) + q * 0.37), x = b.x0 + 2 + ((q * 5) % 10);
+      if (ph < 0.5) fset(S, x, b.y, GLOW[4]);
+      else if (ph < 0.65) fset(S, x, b.y - 1, GLOW[3]);
+      else if (ph < 0.75) { fset(S, x - 1, b.y - 2, GLOW[2]); fset(S, x + 1, b.y - 2, GLOW[2]); }
+    }
+  }
+
+  function lanternPos(S) {
+    const Lt = S.lantern, sw = 0.07 * wave(S.u, 40) + 0.03 * wave(S.u, 97, 0.3);
+    return { sw, x: Lt.px + Math.round(Math.sin(sw) * Lt.len), y: Lt.py + Lt.len };
+  }
+  function drawLantern(S) {
+    const Lt = S.lantern, p = lanternPos(S), k = S.lanternLight.cur;
+    for (let t = 0; t < Lt.len; t++) fset(S, Lt.px + Math.round(Math.sin(p.sw) * t), Lt.py + t, ROPE);
+    const g = k > 0.93 ? 4 : 3;
+    const rows = ['..r..', '.###.', '#ggg#', '#gcg#', '#ggg#', '.###.'];
+    rows.forEach((row, j) => {
+      for (let i = 0; i < 5; i++) {
+        const ch = row[i], x = p.x - 2 + i, y = p.y + j;
+        if (ch === 'r') fset(S, x, y, ROPE);
+        else if (ch === '#') fset(S, x, y, i === 0 || j === 1 ? IRON_LIT : IRON_DARK);
+        else if (ch === 'g') fset(S, x, y, GLOW[bayer(x, y) < 0.5 ? 2 : 3]);
+        else if (ch === 'c') fset(S, x, y, GLOW[g]);
+      }
+    });
+    return p;
+  }
+
+  function drawPorchLamp(S) {
+    const { x, y } = S.porchLamp, k = S.porchLight.cur;
+    fset(S, x + 1, y - 3, IRON_DARK); fset(S, x + 2, y - 3, IRON_DARK);
+    fset(S, x - 1, y - 2, IRON_LIT); fset(S, x, y - 2, IRON_LIT); fset(S, x + 1, y - 2, IRON_DARK);
+    for (let j = -1; j <= 1; j++) { fset(S, x - 1, y + j, GLOW[j === 0 && k > 0.9 ? 4 : 3]); fset(S, x, y + j, GLOW[2]); }
+    fset(S, x - 1, y + 2, IRON_DARK); fset(S, x, y + 2, IRON_DARK);
+  }
+
+  function drawJacks(S) {
+    for (const j of S.jacks) {
+      const k = j.light.cur;
+      for (const [x, y] of j.pts) {
+        const v = k + (bayer(x, y) - 0.5) * 0.3;
+        fset(S, x, y, GLOW[v > 0.95 ? 4 : v > 0.78 ? 3 : 2]);
+      }
+    }
+  }
+
+  const MOUSE = hex('#34221f'), MOUSE_LIT = hex('#8a5634'), WAX = hex('#d9c49a');
+  function drawBurrow(S) {
+    const bx = BURROW.x, by = BURROW.y, k = S.burrowLight.cur;
+    for (let j = 2; j <= 4; j++) fset(S, bx + 3, by + j, WAX);
+    fset(S, bx + 3, by + 1, GLOW[4]);
+    if (k > 0.86) fset(S, bx + 3, by, GLOW[2]);
+    // A mouse keeping the candle company; its ear twitches now and then.
+    const ear = fract(S.u * 9) < 0.04 ? 1 : 0;
+    const rows = ['..#..', '.####', '#####'];
+    rows.forEach((row, j) => { for (let i = 0; i < 5; i++) if (row[i] === '#') fset(S, bx - 5 + i, by + 2 + j - (j === 0 ? ear : 0), i === 4 || (i === 3 && j) ? MOUSE_LIT : MOUSE); });
+    fset(S, bx - 6, by + 4, MOUSE); fset(S, bx - 7, by + 4, MOUSE); fset(S, bx - 8, by + 3, MOUSE);
+  }
+
+  /* House windows: warm glass with a hot center, plus small lives inside each one. */
+  const SIL = hex('#1c1117'), MULL = hex('#2a1c1e'), CURT = [hex('#5a2a22'), hex('#7a3a26')];
+  const CAT_ROWS = ['.#...#.', '.#####.', '.#####.', '..###..', '.#####.', '#######', '#######', '.#####.'];
+  const CAT_TAIL = [
+    [[7, 12], [8, 12], [9, 11], [9, 10], [10, 9]],
+    [[7, 12], [8, 12], [9, 12], [10, 11], [11, 10]],
+    [[7, 12], [8, 11], [9, 10], [9, 9], [8, 8]],
+  ];
+  const FIG_ROWS = ['..###..', '..###..', '..###..', '...#...', '.#####.', '#######', '#######'];
+  const figNod = loopNoise(515, 30);
+
+  function drawWindows(S) {
+    const u = S.u;
+    for (const w of S.windows) {
+      const k = w.light.cur;
+      const px = (x, y, c) => fset(S, x + houseLean(y), y, c);
+      const at = (i, j, c) => px(w.x0 + i, w.y0 + j, c);
+      for (let j = 0; j < w.h; j++) for (let i = 0; i < w.w; i++) {
+        if (w.round && (i - 4) * (i - 4) + (j - 4) * (j - 4) > 17) continue;
+        const cx = (i + 0.5) / w.w - 0.5, cy = (j + 0.5) / w.h - 0.4;
+        let v = k * (1.15 - Math.hypot(cx, cy) * 1.5);
+        if (w.kind === 'curtain') v = k * (i % 3 === 0 ? 0.35 : i === 4 ? 0.8 : 0.55);
+        at(i, j, GLOW[clamp(Math.floor(v * 4 + bayer(w.x0 + i, w.y0 + j)), 0, 4)]);
+      }
+      if (w.kind === 'cat') {
+        for (let j = 0; j < w.h; j++) {
+          at(8, j, MULL);
+          const cw = j >= 4 && j <= 8 ? 1 : 2;
+          for (let i = 0; i < cw; i++) { at(i, j, CURT[i]); at(w.w - 1 - i, j, CURT[i]); }
+        }
+        for (let i = 0; i < w.w; i++) at(i, 6, MULL);
+        CAT_ROWS.forEach((row, j) => { for (let i = 0; i < 7; i++) if (row[i] === '#') at(1 + i, 5 + j, SIL); });
+        const s = wave(u, 20);                                   // tail swish, 6 s cycle
+        for (const [i, j] of CAT_TAIL[s < -0.33 ? 0 : s > 0.33 ? 2 : 1]) at(1 + i, j, SIL);
+        if (fract(u * 12 + 0.2) < 0.02) at(2, 5, GLOW[1]);       // an ear flick
+      } else if (w.kind === 'figure') {
+        const nod = figNod(u) > 0.62 ? 1 : 0;                    // someone reading, now and then looking up
+        FIG_ROWS.forEach((row, j) => { for (let i = 0; i < 7; i++) if (row[i] === '#') at(1 + i + (j < 3 ? nod : 0), 4 + j, SIL); });
+        for (let i = 0; i < w.w; i++) at(i, 2, MULL);
+      } else if (w.kind === 'plain') {
+        for (let j = 0; j < w.h; j++) at(4, j, MULL);
+        for (let i = 0; i < w.w; i++) at(i, 4, MULL);
+        for (const [i, j] of [[6, 5], [5, 6], [7, 6], [6, 6], [5, 7], [6, 7], [7, 7], [5, 8], [6, 8], [7, 8]]) at(i, j, SIL);
+      } else if (w.kind === 'attic') {
+        const ph = fract(u * 4 + 0.1);                           // a shadow walks past, 4x per loop
+        if (ph < 0.07) {
+          const sx = Math.floor(-3 + (ph / 0.07) * 13);
+          for (let j = 0; j < 9; j++) for (let i = sx; i < sx + 3; i++) if (i >= 0 && i < 9 && (i - 4) * (i - 4) + (j - 4) * (j - 4) <= 17) at(i, j, SIL);
+        }
+        for (let j = 0; j < 9; j++) if ((j - 4) * (j - 4) <= 17) at(4, j, MULL);
+        for (let i = 0; i < 9; i++) at(i, 4, MULL);
+      }
+    }
+  }
+
+  layer(50, 'glow', (S) => { S.drawWindows = drawWindows; }, (S) => {
+    if (S.drawWindows) S.drawWindows(S);
+    drawJacks(S);
+    const lp = drawLantern(S);
+    drawPorchLamp(S);
+    drawBrew(S);
+    drawFire(S);
+    drawBurrow(S);
+    const amber = GLOW[2];
+    halo(S, FIRE.x, FIRE.y - 9, 34, amber, 0.32 * S.fireLight.cur);
+    halo(S, lp.x, lp.y + 3, 18, amber, 0.34 * S.lanternLight.cur);
+    halo(S, S.porchLamp.x, S.porchLamp.y, 13, amber, 0.3 * S.porchLight.cur);
+    for (const j of S.jacks) halo(S, j.x, j.y, 9, amber, 0.24 * j.light.cur);
+    for (const w of S.windows) {
+      const cy = Math.round(w.y0 + w.h / 2);
+      halo(S, Math.round(w.x0 + w.w / 2) + houseLean(cy), cy, Math.max(w.w, w.h) + 3, amber, 0.12 * w.light.cur);
+    }
+    halo(S, BURROW.x + 3, BURROW.y + 1, 9, amber, 0.3 * S.burrowLight.cur);
+  });
+
+  /* Rain (orders 28 and 80). Every drop loops an integer number of times per loop.
+     Streaks that pass through the warm light buffer take on firelight colors. */
+  const RAIN_SLANT = 0.22;
+  const RAIN_SPECS = [
+    { n: 460, len: [2, 3], v: 230, c: hex('#2a3754'), a: 0.5 },     // far: behind the island
+    { n: 260, len: [4, 5], v: 340, c: hex('#4a5f84'), a: 0.5 },
+    { n: 80, len: [7, 9], v: 470, c: hex('#7890b4'), a: 0.55 },
+  ];
+  const RAIN_WARM = [hex('#b8642c'), hex('#e8923c'), hex('#ffc868')];
+  const SPLASH_C = hex('#8fa3bd'), WATER_C = ['#a9bbd4', '#6b82a6', '#465a7e'].map(hex);
+
+  function buildRain(S, spec, seed) {
+    const r = rng(seed), drops = [];
+    for (let i = 0; i < spec.n; i++) {
+      const len = spec.len[0] + Math.floor(r() * (spec.len[1] - spec.len[0] + 1));
+      const travel = S.H + len * 2 + 4, v = spec.v * (0.85 + r() * 0.3);
+      drops.push({ x0: r() * S.W, ph: r(), k: Math.max(1, Math.round((T * v) / travel)), len, travel });
+    }
+    return drops;
+  }
+  function drawRain(S, spec, drops) {
+    const { W, H, ox, oy, buf, u } = S, F = S.flash;
+    for (const d of drops) {
+      const y = Math.floor(fract(d.k * u + d.ph) * d.travel) - d.len - 2, x = d.x0 + y * RAIN_SLANT;
+      for (let t = 0; t < d.len; t++) {
+        const py = y - t;
+        if (py < 0 || py >= H) continue;
+        let px = Math.floor(x - t * RAIN_SLANT) % W;
+        if (px < 0) px += W;
+        const L = lightAt(S, px - ox, py - oy);
+        let c = spec.c, a = spec.a * (1 - t / (d.len + 1)) + 0.15;
+        if (L > 0.12) { c = RAIN_WARM[L > 0.9 ? 2 : L > 0.45 ? 1 : 0]; a += 0.15; }
+        if (F > 0.05) c = mix(c, CLOUD_RAMP[6], Math.min(1, F * 0.6));
+        blend(buf, py * W + px, c, a);
+      }
+    }
+  }
+
+  function buildSplashes(S) {
+    const r = rng(1201), cand = [];
+    for (let n = 0; n < 900; n++) {          // anywhere on the grass top
+      const x = 70 + Math.floor(r() * 340), yb = islBack(x), yf = islFront(x);
+      const y = Math.floor(yb + 1 + r() * (yf - yb - 2));
+      if (S.mid[y * BASE_W + x] === MAT.grass) cand.push([x, y]);
+    }
+    for (let x = 60; x < 420; x++) {          // the skyline of every prop: roofs, stones, rims
+      for (let y = 60; y < 200; y++) {
+        const m = S.mid[y * BASE_W + x];
+        if (!m) continue;
+        if (m !== MAT.bark && r() < 0.6) cand.push([x, y]);
+        break;
+      }
+    }
+    const list = [];
+    for (let i = 0; i < 90; i++) list.push({ ph: r(), k: 70 + Math.floor(r() * 60), id: i });
+    return { cand, list };
+  }
+  function drawSplashes(S) {
+    const { cand, list } = S.splash, N = cand.length;
+    for (const s of list) {
+      const q = s.k * S.u + s.ph, f = q - Math.floor(q);
+      if (f > 0.14) continue;
+      const [x, y] = cand[((Math.floor(q) % s.k) * 7919 + s.id * 104729) % N];   // new spot every cycle
+      const L = lightAt(S, x, y), c = L > 0.15 ? RAIN_WARM[L > 0.6 ? 2 : 1] : SPLASH_C;
+      if (f < 0.045) fblend(S, x, y - 1, c, 0.85);
+      else if (f < 0.09) { fblend(S, x - 1, y - 2, c, 0.7); fblend(S, x + 1, y - 2, c, 0.7); }
+      else { fblend(S, x - 2, y - 2, c, 0.4); fblend(S, x + 2, y - 1, c, 0.4); }
+    }
+  }
+
+  function buildDrips(S) {
+    const wingEdge = HOUSE.wing.x1 + 4;
+    const pts = [
+      [HOUSE.eaveL + houseLean(128), 129], [HOUSE.eaveR + houseLean(128), 129],
+      [HOUSE.door.x0 - 5 + houseLean(158), 160], [HOUSE.door.x1 + 5 + houseLean(158), 160],
+      [wingEdge + houseLean(150), Math.round(137 + (wingEdge - HOUSE.wing.x0) * 0.5) + 4],
+      [S.lantern.px - 7, S.lantern.py + 1],
+    ];
+    return pts.map(([x, y], i) => {
+      let g = y + 2;
+      while (g < 205 && !S.mid[g * BASE_W + x]) g++;
+      return { x, y, g, k: 45 + i * 7, ph: i * 0.29 };
+    });
+  }
+  function drawDrips(S) {
+    for (const d of S.drips) {
+      const f = fract(d.k * S.u + d.ph), L = lightAt(S, d.x, d.y);
+      const c = L > 0.2 ? RAIN_WARM[2] : WATER_C[0];
+      if (f < 0.55) { if (f > 0.25) fblend(S, d.x, d.y, c, (f - 0.25) * 2.5); }
+      else if (f < 0.9) {
+        const t = (f - 0.55) / 0.35, y = d.y + (d.g - d.y) * t * t;
+        fblend(S, d.x, y, c, 0.9); fblend(S, d.x, y - 1, c, 0.45);
+      } else { fblend(S, d.x - 1, d.g - 1, c, 0.6); fblend(S, d.x + 1, d.g - 2, c, 0.5); }
+    }
+  }
+
+  const FALLS = [97, 391];
+  function drawFalls(S) {
+    const u = S.u;
+    for (const fx of FALLS) {
+      const top = Math.round(islFront(fx));
+      for (let y = top; y < Math.min(BASE_H + 20, S.H - S.oy); y++) {
+        const a = 0.9 * (1 - smooth(top + 25, top + 70, y));
+        if (a <= 0.02) break;
+        const wob = y - top > 6 && fract(y * 0.11 - u * 300) < 0.3 ? 1 : 0;
+        for (let w = 0; w < 2; w++) {
+          const v = fract(y * 0.23 - u * 2200 + w * 0.5);
+          fblend(S, fx + w + wob, y, WATER_C[v < 0.25 ? 0 : v < 0.6 ? 1 : 2], a);
+        }
+      }
+      fblend(S, fx - 1, top, WATER_C[0], 0.7);
+      fblend(S, fx + 2, top, WATER_C[1], 0.5);
+    }
+  }
+
+  /* Puddles (order 60): each row averages a band of the finished scene above it, a squashed
+     mirror image, with a slow wobble and rain rings. */
+  const PUDDLES = [[318, 190, 10, 2.5], [205, 195, 9, 2.5], [154, 195, 8, 2], [365, 189, 9, 2.2]];
+  const WATER_BASE = hex('#101726'), WATER_RIM = hex('#2c3a58');
+  layer(60, 'puddles', (S) => {
+    const r = rng(1601);
+    S.puddles = PUDDLES.map(([cx, cy, rx, ry]) => {
+      const px = [];
+      for (let j = -Math.ceil(ry); j <= Math.ceil(ry); j++) for (let i = -rx; i <= rx; i++) {
+        const e = (i * i) / (rx * rx) + (j * j) / (ry * ry);
+        if (e <= 1) px.push([cx + i, cy + j, e]);
+      }
+      const rip = [];
+      for (let q = 0; q < 3; q++) rip.push({ ph: r(), k: 45 + Math.floor(r() * 40), dx: (r() - 0.5) * rx * 1.1, dy: (r() - 0.5) * ry });
+      return { cx, cy, rx, ry, top: cy - Math.ceil(ry), px, rip };
+    });
+  }, (S) => {
+    const { buf, W, H, ox, oy, u } = S;
+    for (const p of S.puddles) {
+      for (const [x, y, e] of p.px) {
+        const fx = x + ox, fy = y + oy;
+        if (fx < 0 || fy < 0 || fx >= W || fy >= H) continue;
+        const d = y - p.top, sx = clamp(fx + Math.round(Math.sin(y * 2.1 + u * TAU * 90) * 0.8), 0, W - 1);
+        let rr = 0, gg = 0, bb = 0, n = 0, best = 0, bestL = -1;
+        for (let k = 0; k < 7; k++) {
+          const sy = p.top + oy - 2 - d * 7 - k;
+          if (sy < 0) break;
+          const c = buf[sy * W + sx], l = R(c) + G(c) + B(c);
+          rr += R(c); gg += G(c); bb += B(c); n++;
+          if (l > bestL) { bestL = l; best = c; }
+        }
+        if (!n) continue;
+        let c = (0xff000000 | ((bb / n) << 16) | ((gg / n) << 8) | (rr / n)) >>> 0;
+        c = mix(c, best, 0.6);                              // lights dominate reflections
+        c = mix(c, WATER_BASE, 0.2 + e * 0.3);
+        if (e > 0.6) c = mix(c, y < p.cy ? WATER_RIM : WATER_BASE, 0.55);   // bright far edge, dark near edge
+        buf[fy * W + fx] = c;
+      }
+      for (const q of p.rip) {
+        const f = fract(q.k * u + q.ph);
+        if (f > 0.35) continue;
+        const rad = 0.6 + (f / 0.35) * p.rx * 0.55, a = (1 - f / 0.35) * 0.6;
+        const cx = p.cx + q.dx, cy = p.cy + q.dy, lit = lightAt(S, Math.round(cx), Math.round(cy)) > 0.2;
+        for (let t = 0; t < 16; t++) {
+          const x = Math.round(cx + Math.cos((t / 16) * TAU) * rad), y = Math.round(cy + Math.sin((t / 16) * TAU) * rad * 0.3);
+          const ex = (x - p.cx) / p.rx, ey = (y - p.cy) / p.ry;
+          if (ex * ex + ey * ey <= 1) fblend(S, x, y, lit ? RAIN_WARM[1] : SPLASH_C, a);
+        }
+      }
+    }
+  });
+
+  /* Smoke (order 70) and sparks (order 75). Each particle's age is fract(k*u + phase) with
+     integer k, so every plume and ember recycles exactly on the loop. */
+  const SMOKE_COLD = hex('#5a6682'), SMOKE_DARK = hex('#3e4964'), SMOKE_WARM = hex('#a07050');
+  const smokeN = tileNoise(1701, 32, 32);
+  const SMOKE_SRC = [
+    { x: 0, y: 0, key: 'chimney', n: 34, k: 20, rise: 66, drift: 64, r0: 2, r1: 11, a: 0.95 },
+    { x: FIRE.x, y: CAULDRON.y - 4, key: 'fire', n: 24, k: 30, rise: 54, drift: 46, r0: 2, r1: 9, a: 0.75 },
+  ];
+  function drawPuff(S, x, y, rad, alpha, seed) {
+    const ri = Math.ceil(rad);
+    for (let j = -ri; j <= ri; j++) for (let i = -ri; i <= ri; i++) {
+      const d = Math.hypot(i, j) / rad;
+      if (d >= 1) continue;
+      const px = Math.round(x) + i, py = Math.round(y) + j;
+      const fx = px + S.ox, fy = py + S.oy;
+      if (fx < 0 || fy < 0 || fx >= S.W || fy >= S.H) continue;
+      const wisp = 0.45 + 0.9 * smokeN(px / 5 + seed, py / 5 + seed * 3);
+      const q = dq(alpha * Math.pow(1 - d, 0.7) * wisp, fx, fy, 4);
+      if (q <= 0) continue;
+      const L = lightAt(S, px, py);
+      const c = L > 0.25 ? mix(SMOKE_COLD, SMOKE_WARM, Math.min(1, L)) : d > 0.6 ? SMOKE_DARK : SMOKE_COLD;
+      blend(S.buf, fy * S.W + fx, c, Math.min(0.85, q));
+    }
+  }
+  layer(70, 'smoke', (S) => {
+    SMOKE_SRC[0].x = S.chimneyTop.x;
+    SMOKE_SRC[0].y = S.chimneyTop.y;
+  }, (S) => {
+    const u = S.u, gust = 1 + 0.25 * wave(u, 3, 0.2);
+    for (const src of SMOKE_SRC) {
+      for (let i = 0; i < src.n; i++) {
+        const seed = i * 0.618, a = fract(src.k * u + i / src.n + 0.013 * Math.sin(i * 12.9));
+        const vary = 0.75 + 0.5 * fract(Math.sin(i * 78.233) * 43758.5);   // each puff drifts its own way
+        const rise = 1 - Math.pow(1 - a, 1.6);
+        const x = src.x + (a * a * src.drift * vary + a * 8) * gust + Math.sin(TAU * (a * 1.5 + seed)) * 5 * a;
+        const y = src.y - rise * src.rise * (1.2 - vary * 0.4);
+        const alpha = Math.pow(1 - a, 1.3) * smooth(0, 0.08, a) * src.a;
+        drawPuff(S, x, y, src.r0 + a * (src.r1 - src.r0), alpha, seed * 7);
+      }
+    }
+  });
+
+  const SPARK_C = ['#fff4d6', '#ffd27a', '#f0a040', '#c24a22', '#7a2a1e'].map(hex);
+  layer(75, 'sparks', (S) => {
+    const r = rng(1901);
+    S.sparks = [];
+    for (let i = 0; i < 44; i++) {
+      const chim = i >= 40;
+      S.sparks.push({
+        chim, ph: r(), k: (chim ? 40 : 60) + Math.floor(r() * 45), on: 0.45 + r() * 0.5,
+        dx: (r() - 0.5) * (chim ? 4 : 12), vx: (r() - 0.5) * 1.4, up: (chim ? 26 : 38) + r() * 34,
+        wf: 1 + r() * 3, ws: r(),
+      });
+    }
+  }, (S) => {
+    const u = S.u, ct = S.chimneyTop;
+    for (const s of S.sparks) {
+      const a = fract(s.k * u + s.ph);
+      if (a > s.on) continue;                          // some embers die early
+      const t = a / s.on;
+      const x0 = s.chim ? ct.x : FIRE.x, y0 = s.chim ? ct.y + 1 : FIRE.y - 6;
+      const x = x0 + s.dx * (0.3 + t) + s.vx * t * 20 + t * t * 26 + Math.sin(TAU * (t * s.wf + s.ws)) * 2;
+      const y = y0 - t * s.up;
+      if (t < (s.chim ? 0.1 : 0.12)) continue;          // born inside the flames / flue
+      const c = SPARK_C[Math.min(4, Math.floor(t * 5))];
+      fset(S, x, y, c);
+      if (t < 0.3) fblend(S, x, y + 1, SPARK_C[2], 0.5);   // short trail while hot
+    }
+  });
+
+  /* Bats (order 15): flutter across the sky, one path crosses the moon. */
+  const BAT_FRAMES = [
+    ['#.....#', '##.#.##', '.#####.', '...#...'],
+    ['.......', '###.###', '.#####.', '...#...'],
+    ['.......', '...#...', '.#####.', '##.#.##'],
+  ];
+  const BAT_C = hex('#06070e');
+  const BATS = [
+    { k: 1, ph: 0.12, dur: 0.11, x0: -30, x1: 520, y: 50, amp: 7 },
+    { k: 2, ph: 0.55, dur: 0.13, x0: 520, x1: -30, y: 92, amp: 10 },
+    { k: 1, ph: 0.71, dur: 0.1, x0: -30, x1: 520, y: 118, amp: 6 },
+  ];
+  layer(15, 'bats', null, (S) => {
+    for (let b = 0; b < BATS.length; b++) {
+      const bt = BATS[b], c = fract(bt.k * S.u + bt.ph);
+      if (c >= bt.dur) continue;
+      const t = c / bt.dur;
+      const x = Math.round(bt.x0 + (bt.x1 - bt.x0) * t);
+      const y = Math.round(bt.y + bt.amp * Math.sin(TAU * t * 3) + 2 * Math.sin(TAU * t * 11));
+      const fr = BAT_FRAMES[Math.floor(fract(S.u * 900 + b * 0.3) * 3)];
+      fr.forEach((row, j) => { for (let i = 0; i < 7; i++) if (row[i] === '#') fset(S, x - 3 + i, y + j, BAT_C); });
+    }
+  });
+
+  /* Crow on the graveyard cross (order 52): turns its head, caws now and then. */
+  const CROW_C = hex('#0b0c15'), CROW_RIM = hex('#3a4460'), CROW_WARM = hex('#8a5a3a'), CROW_EYE = hex('#9fb0c2');
+  const crowTurn = loopNoise(2101, 40);
+  layer(52, 'crow', null, (S) => {
+    const ct = S.crossTop;
+    if (!ct) return;
+    const flip = crowTurn(S.u) > 0.62, caw = fract(S.u * 5 + 0.43) < 0.012;
+    const rows = ['.##...', (caw ? '#.##..' : '####..'), '.####.', '..####', '..#.#.'];
+    const lit = lightAt(S, ct.x, ct.y - 4) > 0.3;
+    rows.forEach((row, j) => {
+      for (let i = 0; i < 6; i++) {
+        if (row[i] !== '#') continue;
+        const x = flip ? ct.x + 3 - i : ct.x - 2 + i, y = ct.y - 5 + j;
+        fset(S, x, y, j === 0 || (j === 2 && i === 1) ? (lit ? CROW_WARM : CROW_RIM) : CROW_C);
+      }
+    });
+    fset(S, flip ? ct.x + 1 : ct.x, ct.y - 4, CROW_EYE);
+  });
+
+  /* Ground fog (order 90): thin wisps drifting across the island top, 2 tiles per loop. */
+  const FOG_C = hex('#7a8aa8'), FOG_WARM = hex('#b08060'), FOG_Y0 = 166, FOG_TH = 44;
+  layer(90, 'fog', (S) => {
+    const n = tileFbm(2201, 16, 8, 3);
+    S.fogTex = new Float32Array(480 * FOG_TH);
+    for (let y = 0; y < FOG_TH; y++) {
+      const prof = smooth(FOG_Y0, FOG_Y0 + 18, FOG_Y0 + y) * (1 - smooth(FOG_Y0 + 30, FOG_Y0 + FOG_TH, FOG_Y0 + y));
+      for (let x = 0; x < 480; x++) S.fogTex[y * 480 + x] = n(x / 30, y / 5) * prof;
+    }
+  }, (S) => {
+    const { buf, W, H, ox, oy } = S, off = Math.floor(S.u * 480 * 2);
+    for (let ty = 0; ty < FOG_TH; ty++) {
+      const sy = FOG_Y0 + ty, fy = sy + oy;
+      if (fy < 0 || fy >= H) continue;
+      for (let sx = 40; sx < 440; sx++) {
+        const fx = sx + ox;
+        if (fx < 0 || fx >= W) continue;
+        let tx = (sx - off) % 480;
+        if (tx < 0) tx += 480;
+        const edge = 1 - smooth(150, 200, Math.abs(sx - 240));
+        const q = dq(smooth(0.42, 0.75, S.fogTex[ty * 480 + tx]) * 0.32 * edge, fx, fy, 4);
+        if (q <= 0) continue;
+        const L = lightAt(S, sx, sy);
+        blend(buf, fy * W + fx, L > 0.3 ? FOG_WARM : FOG_C, q);
+      }
+    }
+  });
+
+  layer(28, 'rain-far', (S) => {
+    S.rain = RAIN_SPECS.map((spec, i) => buildRain(S, spec, 3001 + i * 17));
+  }, (S) => drawRain(S, RAIN_SPECS[0], S.rain[0]));
+
+  layer(80, 'rain-near', (S) => {
+    S.splash = buildSplashes(S);
+    S.drips = buildDrips(S);
+  }, (S) => {
+    drawFalls(S);
+    drawSplashes(S);
+    drawDrips(S);
+    drawRain(S, RAIN_SPECS[1], S.rain[1]);
+    drawRain(S, RAIN_SPECS[2], S.rain[2]);
+  });
+
+  // @@LAYERS
+
+  function pickScale(dw, dh) {
+    let s = Math.max(1, Math.round(Math.min(dw / BASE_W, dh / BASE_H)));
+    while (s > 1 && (dw / s < CORE_W || dh / s < CORE_H)) s--;
+    return s;
+  }
+
+  function createScene(W, H, opts) {
+    const buf = new Uint32Array(W * H);
+    const S = {
+      W, H,
+      ox: Math.floor((W - BASE_W) / 2),   // stage origin inside the frame
+      oy: Math.floor((H - BASE_H) / 2),
+      buf,
+      bytes: new Uint8ClampedArray(buf.buffer),
+      opts: Object.assign({ lightning: true }, opts),
+      t: 0, u: 0,
+    };
+    const list = LAYERS.slice().sort((a, b) => a.order - b.order);
+    for (const l of list) if (l.init) l.init(S);
+    S.render = function (t) {
+      const lt = ((t % T) + T) % T;
+      S.t = lt;
+      S.u = lt / T;
+      for (const l of list) if (l.draw) l.draw(S);
+      return S.bytes;
+    };
+    return S;
+  }
+
+  return { T, BASE_W, BASE_H, FLASH_TIMES: FLASHES.map((f) => f.t), pickScale, createScene };
+})();
+if (typeof globalThis !== 'undefined') globalThis.HollowRain = HollowRain;
+</script>
+
+<script id="music">
+/* Hollow Rain soundtrack: a small deterministic chiptune synth (two pulse channels, a stepped
+   triangle, an LFSR noise channel) playing a swung A-minor tune at 80 BPM. render() returns
+   exactly one 120 s loop; notes that ring past the end wrap to the start, so there is no seam. */
+var HollowMusic = (function () {
+  'use strict';
+  const T = 120, BPM = 80, BEAT = 60 / BPM, BAR = BEAT * 4, SWING = 0.58, TAU = Math.PI * 2;
+  const MASTER = 1.6;
+
+  const NOTE = { C: 0, 'C#': 1, D: 2, 'D#': 3, E: 4, F: 5, 'F#': 6, G: 7, 'G#': 8, A: 9, 'A#': 10, B: 11 };
+  function freq(name) {
+    const m = /^([A-G]#?)(\d)$/.exec(name);
+    return 440 * Math.pow(2, (NOTE[m[1]] + (Number(m[2]) + 1) * 12 - 69) / 12);
+  }
+  const semi = (f, n) => f * Math.pow(2, n / 12);
+  // Start time of an 8th-note step in a bar; offbeats land late for a lazy swing.
+  const at = (bar, e) => bar * BAR + Math.floor(e / 2) * BEAT + (e % 2 ? SWING * BEAT : 0);
+
+  function rng(seed) {
+    let a = seed >>> 0;
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  const CHORDS = {
+    Am7: ['A3', 'C4', 'E4', 'G4'], Fmaj7: ['F3', 'A3', 'C4', 'E4'], C: ['C4', 'E4', 'G4', 'C5'],
+    E7: ['E3', 'G#3', 'B3', 'D4'], Dm7: ['D3', 'F3', 'A3', 'C4'], G7: ['G3', 'B3', 'D4', 'F4'],
+    Cmaj7: ['C4', 'E4', 'G4', 'B4'], Bm7b5: ['B3', 'D4', 'F4', 'A4'],
+  };
+  const ROOTS = { Am7: 'A2', Fmaj7: 'F2', C: 'C3', E7: 'E2', Dm7: 'D2', G7: 'G2', Cmaj7: 'C3', Bm7b5: 'B2' };
+  const INTRO = ['Am7', 'Fmaj7', 'Dm7', 'E7', 'Am7', 'Fmaj7', 'Dm7', 'E7'];
+  const VERSE = ['Am7', 'Fmaj7', 'C', 'E7', 'Am7', 'Fmaj7', 'Dm7', 'E7'];
+  const BRIDGE = ['Dm7', 'G7', 'Cmaj7', 'Fmaj7', 'Bm7b5', 'E7', 'Am7', 'E7'];
+  // 40 bars x 3 s = 120 s. The last bar is E7, which resolves into the first bar's Am7.
+  const SONG = [].concat(INTRO, VERSE, VERSE, BRIDGE, INTRO);
+  const SECTIONS = ['intro', 'verse', 'verse2', 'bridge', 'outro'];
+
+  // Melody, one string per bar: note:length in 8ths, r = rest. Every bar adds up to 8.
+  const MELODY = [].concat(
+    ['', '', '', '', '', '', '', ''],
+    ['A4:2 C5:2 E5:3 D5:1', 'C5:4 A4:2 G4:2', 'E5:2 G5:2 E5:1 D5:1 C5:2', 'B4:4 G#4:2 r:2',
+     'A4:2 C5:2 E5:3 A5:1', 'G5:2 F5:1 E5:1 C5:4', 'D5:2 F5:2 E5:1 D5:1 C5:2', 'B4:3 C5:1 B4:2 G#4:2'],
+    ['E5:2 A5:2 G5:1 E5:1 C5:2', 'A4:3 C5:1 F5:4', 'E5:2 D5:1 C5:1 G4:4', 'G#4:2 B4:2 D5:2 E5:2',
+     'C6:3 B5:1 A5:2 E5:2', 'F5:2 E5:2 C5:2 A4:2', 'D5:3 E5:1 F5:2 A5:2', 'G#5:4 E5:2 B4:2'],
+    ['F5:4 E5:2 D5:2', 'B4:4 D5:2 F5:2', 'E5:6 G5:2', 'A5:4 G5:2 E5:2',
+     'D5:4 F5:2 A5:2', 'G#5:4 F5:2 E5:2', 'E5:4 C5:2 A4:2', 'B4:4 G#4:4'],
+    ['A4:2 C5:2 E5:4', 'r:8', 'D5:2 F5:2 A5:4', 'G#4:4 r:4', '', '', '', '']
+  );
+
+  // PolyBLEP softens the pulse edges so the square waves buzz without harsh aliasing.
+  function blep(t, dt) {
+    if (t < dt) { t /= dt; return t + t - t * t - 1; }
+    if (t > 1 - dt) { t = (t - 1) / dt; return t * t + t + t + 1; }
+    return 0;
+  }
+
+  function render(sr, opts) {
+    opts = opts || {};
+    const N = Math.round(T * sr), L = new Float32Array(N), Rt = new Float32Array(N);
+    // Tape warble: 30 and 108 whole cycles per loop, tabulated once for speed.
+    const WOB = new Float32Array(N);
+    for (let i = 0; i < N; i++) WOB[i] = 1 + 0.0022 * Math.sin((TAU * i) / sr / 4) + 0.0008 * Math.sin((TAU * i * 0.9) / sr);
+
+    function voice(v) {
+      const i0 = Math.round(v.t * sr), rel = v.r || 0.05, len = Math.round((v.dur + rel) * sr);
+      const a = v.a || 0.004, d = v.d || 0.12, s = v.s === undefined ? 0.7 : v.s, pan = v.pan || 0;
+      const gl = v.vol * Math.min(1, 1 - pan), gr = v.vol * Math.min(1, 1 + pan);
+      const adsr = (tt) => (tt < a ? tt / a : tt < a + d ? 1 - (1 - s) * ((tt - a) / d) : s);
+      const shape = v.shape || adsr, atRel = shape(v.dur);
+      const lpk = v.lp ? 1 - Math.exp((-TAU * v.lp) / sr) : 0;
+      let ph = 0, lfsr = (v.seed || 0x4d2b) & 0x7fff || 1, y1 = 0;
+      for (let n = 0; n < len; n++) {
+        const tt = n / sr;
+        let env = tt < v.dur ? shape(tt) : atRel * (1 - (tt - v.dur) / rel);
+        if (!v.shape) env = Math.round(env * 15) / 15;        // 4-bit volume steps
+        if (env <= 0) continue;
+        const idx = (i0 + n) % N;
+        let x;
+        if (v.wave === 'noise') {
+          ph += v.clk / sr;
+          while (ph >= 1) {
+            ph -= 1;
+            const fb = (lfsr ^ (lfsr >> (v.short ? 6 : 1))) & 1;
+            lfsr = (lfsr >> 1) | (fb << 14);
+          }
+          x = lfsr & 1 ? 1 : -1;
+        } else {
+          let f = v.drop ? v.drop[1] + (v.f - v.drop[1]) * Math.exp(-tt / v.drop[0]) : v.f;
+          f *= WOB[idx];
+          if (v.vib && tt > 0.18) f *= 1 + v.vib * Math.sin(TAU * 5.5 * tt);
+          const dt = f / sr;
+          ph += dt;
+          if (ph >= 1) ph -= 1;
+          if (v.wave === 'tri') x = Math.round((1 - 4 * Math.abs(ph - 0.5)) * 7.5) / 7.5;
+          else {
+            const du = v.duty || 0.5;
+            x = (ph < du ? 1 : -1) + blep(ph, dt) - blep(ph >= du ? ph - du : ph - du + 1, dt) - (2 * du - 1);
+          }
+        }
+        if (lpk) { y1 += lpk * (x - y1); x = y1; }
+        const y = x * env;
+        L[idx] += y * gl;
+        Rt[idx] += y * gr;
+      }
+    }
+
+    const kick = (t, vol) => voice({ t, dur: 0.14, f: 160, drop: [0.03, 42], vol, wave: 'tri', a: 0.001, d: 0.14, s: 0, r: 0.02 });
+    const snare = (t, vol) => {
+      voice({ t, dur: 0.16, clk: 9000, vol, wave: 'noise', a: 0.001, d: 0.16, s: 0, r: 0.03, seed: 0x2f1d, lp: 6000 });
+      voice({ t, dur: 0.07, f: 230, drop: [0.03, 120], vol: vol * 0.8, wave: 'tri', a: 0.001, d: 0.07, s: 0, r: 0.01 });
+    };
+    const hat = (t, vol) => voice({ t, dur: 0.035, clk: 30000, short: true, vol, pan: 0.25, wave: 'noise', a: 0.001, d: 0.035, s: 0, r: 0.01, seed: 0x1234 });
+
+    function drums(bar, sec, ib) {
+      if (sec === 'intro') {
+        if (ib >= 4) for (const e of [1, 3, 5, 7]) hat(at(bar, e), 0.02 + (ib - 4) * 0.004);
+      } else if (sec === 'outro') {
+        if (ib < 4) { kick(at(bar, 0), 0.4); for (const e of [1, 3, 5, 7]) hat(at(bar, e), 0.03 - ib * 0.005); }
+      } else if (sec === 'bridge') {
+        kick(at(bar, 0), 0.4);
+        if (ib % 2) kick(at(bar, 5), 0.3);
+        snare(at(bar, 6), 0.08);
+        for (const e of [1, 3, 5, 7]) hat(at(bar, e), 0.025);
+      } else {
+        kick(at(bar, 0), 0.5);
+        kick(at(bar, 3), 0.4);
+        if (ib % 2) kick(at(bar, 5), 0.35);
+        snare(at(bar, 2), 0.14);
+        if (ib === 7) for (let k = 0; k < 4; k++) snare(bar * BAR + 3 * BEAT + (k * BEAT) / 4, 0.07 + k * 0.025);   // fill
+        else snare(at(bar, 6), 0.14);
+        for (let e = 0; e < 8; e++) hat(at(bar, e), e % 2 ? 0.035 : 0.018);
+      }
+    }
+
+    function melodyBar(bar, str, sec) {
+      if (!str) return;
+      let e = 0;
+      for (const tok of str.split(' ')) {
+        const [name, l] = tok.split(':'), len = Number(l);
+        if (name !== 'r') {
+          const t = at(bar, e), dur = (at(bar, e + len) - t) * 0.92, f = freq(name);
+          voice({ t, dur, f, vol: 0.13, pan: 0.05, wave: 'pulse', duty: 0.25, a: 0.006, d: 0.25, s: 0.65, r: 0.18, vib: 0.006 });
+          if (sec === 'verse2' || sec === 'bridge') {   // dotted-8th echo on the second pulse channel
+            voice({ t: t + BEAT * 0.75, dur, f, vol: 0.045, pan: 0.5, wave: 'pulse', duty: 0.125, a: 0.006, d: 0.25, s: 0.6, r: 0.25, vib: 0.006 });
+          }
+        }
+        e += len;
+      }
+    }
+
+    const ARP = [0, 1, 2, 3, 4, 3, 2, 1];
+    for (let bar = 0; bar < SONG.length; bar++) {
+      const ch = SONG[bar], sec = SECTIONS[Math.floor(bar / 8)], ib = bar % 8;
+      const tones = CHORDS[ch].map(freq), root = freq(ROOTS[ch]);
+      const arpVol = sec === 'intro' ? 0.035 + ib * 0.003 : sec === 'outro' ? 0.058 - ib * 0.003 : 0.055;
+      for (let e = 0; e < 8; e++) {
+        const f = ARP[e] === 4 ? tones[0] * 2 : tones[ARP[e]];
+        voice({ t: at(bar, e), dur: BEAT * 0.3, f, vol: arpVol, pan: -0.35, wave: 'pulse', duty: 0.125, d: 0.08, s: 0.45, r: 0.12 });
+      }
+      if ((sec === 'intro' && ib < 4) || (sec === 'outro' && ib >= 4)) {
+        voice({ t: at(bar, 0), dur: BAR * 0.95, f: root, vol: 0.3, wave: 'tri', d: 0.6, s: 0.6, r: 0.2 });
+      } else {
+        for (const [e, len, iv] of [[0, 3, 0], [3, 1, 0], [4, 2, 7], [6, 2, 12]]) {
+          voice({ t: at(bar, e), dur: (at(bar, e + len) - at(bar, e)) * 0.9, f: semi(root, iv), vol: 0.3, wave: 'tri', d: 0.1, s: 0.8, r: 0.05 });
+        }
+      }
+      drums(bar, sec, ib);
+      melodyBar(bar, MELODY[bar], sec);
+    }
+
+    // Thunder rolls in just after each lightning flash on screen.
+    for (const tf of opts.thunder || []) {
+      const roll = (tt) => Math.min(1, tt / 0.08) * (0.55 * Math.exp(-tt / 0.5) + 0.45 * Math.min(1, Math.max(0, tt - 0.5) / 0.25) * Math.exp(-Math.max(0, tt - 0.75) / 1.4));
+      voice({ t: tf + 0.9, dur: 4.5, clk: 700, vol: 0.55, pan: -0.2, wave: 'noise', lp: 260, seed: 0x3a71, shape: roll, r: 0.4 });
+      voice({ t: tf + 2.1, dur: 3.5, clk: 520, vol: 0.3, pan: 0.3, wave: 'noise', lp: 180, seed: 0x1b55, shape: roll, r: 0.5 });
+    }
+
+    // Rain hiss (band-passed noise, a little different per ear) and sparse vinyl crackle.
+    const rnd = rng(7331), kHi = 1 - Math.exp((-TAU * 3200) / sr), kLo = 1 - Math.exp((-TAU * 500) / sr);
+    const rain = opts.rain === false ? 0 : 0.09, crackle = opts.crackle === false ? 0 : 1;
+    let a1 = 0, a2 = 0, b1 = 0, b2 = 0;
+    for (let i = 0; i < N; i++) {
+      a1 += kHi * (rnd() * 2 - 1 - a1); a2 += kLo * (a1 - a2);
+      b1 += kHi * (rnd() * 2 - 1 - b1); b2 += kLo * (b1 - b2);
+      L[i] += (a1 - a2) * rain;
+      Rt[i] += (b1 - b2) * rain;
+      if (crackle && rnd() < 2.5 / sr) {
+        const amp = (0.015 + rnd() * 0.045) * (rnd() < 0.5 ? 1 : -1), side = rnd();
+        for (let k = 0; k < 12; k++) {
+          const v = amp * Math.exp(-k / 2) * (k % 2 ? -1 : 1), idx = (i + k) % N;
+          L[idx] += v * (1 - side); Rt[idx] += v * side;
+        }
+      }
+    }
+
+    // Lo-fi master: a gentle low-pass and a DC blocker, both run twice around the loop so
+    // their state carries across the seam, then soft saturation.
+    const k = 1 - Math.exp((-TAU * 5200) / sr);
+    for (const ch of [L, Rt]) {
+      let y = 0, px = 0, hp = 0;
+      for (let pass = 0; pass < 2; pass++) {
+        for (let i = 0; i < N; i++) {
+          y += k * (ch[i] - y);
+          hp = y - px + 0.9995 * hp;
+          px = y;
+          if (pass) ch[i] = Math.tanh(hp * MASTER) * 0.9;
+        }
+      }
+    }
+    return { sampleRate: sr, left: L, right: Rt };
+  }
+
+  return { T, BPM, render };
+})();
+if (typeof globalThis !== 'undefined') globalThis.HollowMusic = HollowMusic;
+</script>
+
+<script>
+(() => {
+  const E = globalThis.HollowRain;
+  const body = document.body;
+  const stage = document.getElementById('stage');
+  const screen = document.getElementById('screen');
+  const sctx = screen.getContext('2d', { alpha: false });
+  const off = document.createElement('canvas');
+  const octx = off.getContext('2d');
+  const clock = document.getElementById('clock');
+  const btnPlay = document.getElementById('btn-play');
+  const btnFull = document.getElementById('btn-full');
+  const btnHide = document.getElementById('btn-hide');
+  const btnSound = document.getElementById('btn-sound');
+  const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  let scene = null, img = null, s = 1, cropX = 0, cropY = 0;
+
+  function layout() {
+    const dpr = window.devicePixelRatio || 1;
+    const dw = Math.max(1, Math.round(window.innerWidth * dpr));
+    const dh = Math.max(1, Math.round(window.innerHeight * dpr));
+    screen.width = dw;
+    screen.height = dh;
+    s = E.pickScale(dw, dh);
+    const W = Math.ceil(dw / s), H = Math.ceil(dh / s);
+    if (!scene || scene.W !== W || scene.H !== H) {
+      scene = E.createScene(W, H, { lightning: !reduce });
+      off.width = W;
+      off.height = H;
+      img = new ImageData(scene.bytes, W, H);
+    }
+    cropX = Math.floor((W * s - dw) / 2);
+    cropY = Math.floor((H * s - dh) / 2);
+    sctx.imageSmoothingEnabled = false;
+    paint(now());
+  }
+
+  // Clock: scene seconds (the engine wraps them to the loop). It runs on performance.now, or on
+  // the audio clock while the soundtrack plays, so picture and music stay locked for hours.
+  const perfClock = () => performance.now() / 1000;
+  let ref = perfClock, base = 0, refStart = ref();
+  let pausedAt = reduce ? 0 : null;
+  const now = () => (pausedAt !== null ? pausedAt : base + (ref() - refStart));
+  function useClock(fn) {
+    const t = now();
+    ref = fn;
+    base = t;
+    refStart = fn();
+  }
+
+  let lastSec = -1;
+  function paint(t) {
+    scene.render(t);
+    octx.putImageData(img, 0, 0);
+    sctx.drawImage(off, -cropX, -cropY, scene.W * s, scene.H * s);
+    const sec = Math.floor(((t % E.T) + E.T) % E.T);
+    if (sec !== lastSec) {
+      lastSec = sec;
+      const m = Math.floor(sec / 60), r = String(sec % 60).padStart(2, '0');
+      clock.textContent = `${m}:${r} / ${Math.floor(E.T / 60)}:${String(E.T % 60).padStart(2, '0')}`;
+    }
+  }
+
+  function frame() {
+    if (pausedAt === null) paint(now());
+    requestAnimationFrame(frame);
+  }
+
+  function setPaused(p) {
+    if (p && pausedAt === null) {
+      pausedAt = now();
+      if (audio.on) audio.ctx.suspend();
+    }
+    if (!p && pausedAt !== null) {
+      base = pausedAt;
+      refStart = ref();
+      pausedAt = null;
+      if (audio.on) audio.ctx.resume();
+    }
+    btnPlay.firstChild.textContent = pausedAt !== null ? 'Play ' : 'Pause ';
+  }
+
+  // Soundtrack: rendered once in a worker (about a second), then looped by Web Audio from the
+  // current scene time. Browsers only allow sound after a click or key press, so it starts off.
+  const audio = { ctx: null, gain: null, buf: null, src: null, on: false, busy: false, failed: false };
+  function setSoundLabel() {
+    btnSound.firstChild.textContent = audio.failed ? 'Sound unavailable ' : audio.busy ? 'Loading sound\u2026 ' : audio.on ? 'Mute ' : 'Sound on ';
+    btnSound.setAttribute('aria-pressed', String(audio.on));
+    btnSound.disabled = audio.busy || audio.failed;
+  }
+  function renderMusic(sr) {
+    const opts = { thunder: reduce ? [] : E.FLASH_TIMES };
+    const local = () => globalThis.HollowMusic.render(sr, opts);
+    return new Promise((resolve) => {
+      try {
+        const code = document.getElementById('music').textContent +
+          '\nonmessage = (e) => { const r = HollowMusic.render(e.data.sr, e.data.opts); postMessage(r, [r.left.buffer, r.right.buffer]); };';
+        const url = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+        const w = new Worker(url);
+        const done = (r) => { w.terminate(); URL.revokeObjectURL(url); resolve(r); };
+        w.onmessage = (e) => done(e.data);
+        w.onerror = () => done(local());
+        w.postMessage({ sr, opts });
+      } catch (err) {
+        setTimeout(() => resolve(local()), 0);
+      }
+    });
+  }
+  async function soundOn() {
+    if (audio.on || audio.busy || audio.failed) return;
+    audio.busy = true;
+    setSoundLabel();
+    try {
+      if (!audio.ctx) {
+        audio.ctx = new (window.AudioContext || window.webkitAudioContext)();
+        audio.gain = audio.ctx.createGain();
+        audio.gain.gain.value = 0.85;
+        audio.gain.connect(audio.ctx.destination);
+      }
+      const ctx = audio.ctx, resumed = ctx.resume();   // resume inside the click that asked for sound
+      if (!audio.buf) {
+        const r = await renderMusic(ctx.sampleRate);
+        audio.buf = ctx.createBuffer(2, r.left.length, r.sampleRate);
+        audio.buf.copyToChannel(r.left, 0);
+        audio.buf.copyToChannel(r.right, 1);
+      }
+      await resumed;
+      const src = ctx.createBufferSource();
+      src.buffer = audio.buf;
+      src.loop = true;
+      src.connect(audio.gain);
+      const t = now();
+      src.start(ctx.currentTime, ((t % E.T) + E.T) % E.T);
+      audio.src = src;
+      audio.on = true;
+      useClock(() => audio.ctx.currentTime);
+      if (pausedAt !== null) ctx.suspend();
+    } catch (err) {
+      audio.failed = true;
+    }
+    audio.busy = false;
+    setSoundLabel();
+  }
+  function soundOff() {
+    if (!audio.on) return;
+    useClock(perfClock);                                 // hand timing back at the same scene time
+    audio.src.stop();
+    audio.src.disconnect();
+    audio.src = null;
+    audio.on = false;
+    audio.ctx.suspend();
+    setSoundLabel();
+  }
+  const toggleSound = () => (audio.on ? soundOff() : soundOn());
+
+  function toggleFull() {
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    else if (stage.requestFullscreen) stage.requestFullscreen().catch(() => {});
+  }
+
+  function toggleHud() { body.classList.toggle('hud-off'); }
+
+  // Controls and cursor fade out after 3 s without input, so the cover can be captured clean.
+  let idleTimer = 0;
+  function wake() {
+    body.classList.remove('idle');
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => body.classList.add('idle'), 3000);
+  }
+
+  btnPlay.addEventListener('click', () => setPaused(pausedAt === null));
+  btnFull.addEventListener('click', toggleFull);
+  btnHide.addEventListener('click', toggleHud);
+  btnSound.addEventListener('click', toggleSound);
+  screen.addEventListener('dblclick', toggleFull);
+  window.addEventListener('keydown', (e) => {
+    if (e.target.closest && e.target.closest('button') && (e.key === ' ' || e.key === 'Enter')) return;
+    if (e.key === 'f' || e.key === 'F') toggleFull();
+    else if (e.key === 'h' || e.key === 'H') toggleHud();
+    else if (e.key === 'm' || e.key === 'M') toggleSound();
+    else if (e.key === ' ') { e.preventDefault(); setPaused(pausedAt === null); }
+    wake();
+  });
+  for (const ev of ['mousemove', 'pointerdown', 'touchstart']) window.addEventListener(ev, wake, { passive: true });
+
+  let rz = 0;
+  window.addEventListener('resize', () => { cancelAnimationFrame(rz); rz = requestAnimationFrame(layout); });
+
+  setPaused(pausedAt !== null);
+  layout();
+  wake();
+  requestAnimationFrame(frame);
+})();
+</script>
